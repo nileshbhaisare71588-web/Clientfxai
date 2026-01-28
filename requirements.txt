@@ -1,0 +1,9 @@
+ccxt
+pandas
+numpy
+python-telegram-bot
+APScheduler
+scikit-learn
+python-dotenv
+gunicorn
+Flask
