@@ -28,7 +28,7 @@ WATCHLIST = [
 
 TIMEFRAME = "1h"
 
-# Global dictionary to store the latest status of every pair
+# Global status
 market_status = {} 
 
 # =========================================================================
@@ -71,7 +71,7 @@ def add_indicators(df):
     df['macd'] = exp1 - exp2
     df['signal_line'] = df['macd'].ewm(span=9, adjust=False).mean()
     
-    # ATR for Stop Loss
+    # ATR
     high_low = df['high'] - df['low']
     high_close = np.abs(df['high'] - df['close'].shift())
     low_close = np.abs(df['low'] - df['close'].shift())
@@ -80,13 +80,10 @@ def add_indicators(df):
     return df.dropna()
 
 # =========================================================================
-# === PROFESSIONAL MESSAGE FORMATTER ===
+# === FORMATTER ===
 # =========================================================================
 
 def format_signal_message(symbol, signal, price, rsi, trend, tp1, tp2, sl):
-    """Creates a beautiful, high-end signal card for Telegram."""
-    
-    # Emoji & Color Logic
     if "STRONG BUY" in signal:
         header = "💎 <b>PREMIUM BUY SIGNAL</b>"
         action = f"🚀 <b>LONG {symbol}</b>"
@@ -96,7 +93,7 @@ def format_signal_message(symbol, signal, price, rsi, trend, tp1, tp2, sl):
         action = f"🔻 <b>SHORT {symbol}</b>"
         color_line = "🔴🔴🔴🔴🔴🔴🔴🔴"
     else:
-        return None # We don't send weak signals automatically
+        return None
 
     fmt = ",.2f" if "JPY" in symbol or "XAU" in symbol else ",.4f"
 
@@ -114,21 +111,20 @@ def format_signal_message(symbol, signal, price, rsi, trend, tp1, tp2, sl):
         f"🚀 <b>TP 2:</b> <code>{tp2:{fmt}}</code>\n"
         f"🛡️ <b>Stop Loss:</b> <code>{sl:{fmt}}</code>\n\n"
         f"{color_line}\n"
-        f"<i>Nilesh Quant System V11</i>"
+        f"<i>Nilesh Quant System V12</i>"
     )
     return msg
 
 # =========================================================================
-# === ANALYSIS ENGINE ===
+# === ANALYSIS & BOT LOGIC ===
 # =========================================================================
 
-async def run_analysis_cycle(context: ContextTypes.DEFAULT_TYPE = None):
-    """Scans all pairs. Sends Alerts for STRONG signals. Saves status for /report."""
+async def run_analysis_cycle(app_instance):
+    """Scans all pairs. Sends Alerts for STRONG signals."""
     global market_status
     print(f"🔄 Scanning Markets... {datetime.now()}")
     
-    # Initialize the bot object if running from scheduler
-    bot_sender = Bot(token=TELEGRAM_BOT_TOKEN) if context is None else context.bot
+    bot_sender = app_instance.bot
 
     for symbol in WATCHLIST:
         try:
@@ -157,14 +153,93 @@ async def run_analysis_cycle(context: ContextTypes.DEFAULT_TYPE = None):
             if cpr and price > cpr['PP']: score += 0.5
             else: score -= 0.5
 
-            # Determine Signal
             signal = "WAIT (Neutral)"
             if score >= 2.5: signal = "STRONG BUY"
             elif 1.0 <= score < 2.5: signal = "BUY"
             elif -2.5 < score <= -1.0: signal = "SELL"
             elif score <= -2.5: signal = "STRONG SELL"
 
-            # Targets
             tp1 = cpr['R1'] if score > 0 else cpr['S1']
             tp2 = cpr['R2'] if score > 0 else cpr['S2']
-            sl = price - (last['atr'] * 1.5) if score > 0 else price
+            sl = price - (last['atr'] * 1.5) if score > 0 else price + (last['atr'] * 1.5)
+            trend = "Bullish 📈" if price > last['ema_200'] else "Bearish 📉"
+
+            market_status[symbol] = f"{signal} | RSI: {rsi:.0f}"
+
+            msg = format_signal_message(symbol, signal, price, rsi, trend, tp1, tp2, sl)
+            if msg:
+                print(f"🚨 Sending Signal for {symbol}")
+                await bot_sender.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode='HTML')
+
+            time.sleep(8)
+
+        except Exception as e:
+            print(f"❌ Error {symbol}: {e}")
+
+# --- COMMANDS ---
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("👋 <b>Nilesh Bot Online!</b>\nType /report to see all pairs.", parse_mode='HTML')
+
+async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not market_status:
+        await update.message.reply_text("⏳ Collecting data... try again in 1 minute.")
+        return
+
+    msg = "📊 <b>LIVE MARKET REPORT</b>\n\n"
+    for sym, status in market_status.items():
+        icon = "⚪"
+        if "STRONG BUY" in status: icon = "🟢"
+        elif "STRONG SELL" in status: icon = "🔴"
+        elif "BUY" in status: icon = "🔹"
+        elif "SELL" in status: icon = "🔸"
+        msg += f"{icon} <b>{sym}:</b> {status}\n"
+    
+    msg += "\n<i>Updated just now.</i>"
+    await update.message.reply_text(msg, parse_mode='HTML')
+
+# =========================================================================
+# === FLASK & THREADING SETUP (RENDER COMPATIBLE) ===
+# =========================================================================
+
+# 1. DEFINE FLASK APP (Must be named 'app')
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return f"Nilesh Bot V12 Active | Monitored: {len(market_status)} pairs"
+
+# 2. DEFINE BOT BACKGROUND WORKER
+def run_telegram_bot():
+    """Runs the Telegram Bot in a separate thread so Gunicorn doesn't crash."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("report", report_command))
+
+    # Send Startup Message
+    loop.run_until_complete(application.bot.send_message(
+        chat_id=TELEGRAM_CHAT_ID, 
+        text="🚀 <b>SYSTEM ONLINE</b>\nBot restarted successfully.", 
+        parse_mode='HTML'
+    ))
+
+    # Start Scheduler inside this loop
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(lambda: asyncio.run_coroutine_threadsafe(run_analysis_cycle(application), loop), 'interval', minutes=30)
+    scheduler.start()
+
+    print("✅ Telegram Bot & Scheduler Started in Background")
+    # Run Polling (Blocking, but okay because we are in a thread)
+    application.run_polling(stop_signals=None)
+
+# 3. START BACKGROUND THREAD ON IMPORT
+# This ensures it runs when Gunicorn loads the app
+if os.environ.get("WERKZEUG_RUN_MAIN") != "true":
+    t = threading.Thread(target=run_telegram_bot, daemon=True)
+    t.start()
+
+if __name__ == '__main__':
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
