@@ -1,8 +1,8 @@
-pandas
-numpy
 flask
+gunicorn
 apscheduler
 python-telegram-bot
+pandas
+numpy
+requests
 python-dotenv
-yfinance
-gunicorn
