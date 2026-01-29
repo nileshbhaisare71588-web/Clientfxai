@@ -5,11 +5,12 @@ import numpy as np
 import asyncio
 import time
 import traceback
+import threading
 from datetime import datetime
 from apscheduler.schedulers.background import BackgroundScheduler
-from telegram import Bot
+from telegram import Bot, Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 from flask import Flask, render_template_string
-import threading
 
 # --- CONFIGURATION ---
 from dotenv import load_dotenv
@@ -27,16 +28,8 @@ WATCHLIST = [
 
 TIMEFRAME = "1h"
 
-# Initialize Bot
-bot = Bot(token=TELEGRAM_BOT_TOKEN)
-
-# GLOBAL STORAGE FOR WEBSITE DATA
-bot_stats = {
-    "status": "Initializing...",
-    "last_run": "Waiting for first cycle...",
-    "version": "V10.0 Pro Interface"
-}
-latest_signals = {} # Stores the latest analysis for the dashboard
+# Global dictionary to store the latest status of every pair
+market_status = {} 
 
 # =========================================================================
 # === DATA ENGINE ===
@@ -77,22 +70,66 @@ def add_indicators(df):
     exp2 = df['close'].ewm(span=26, adjust=False).mean()
     df['macd'] = exp1 - exp2
     df['signal_line'] = df['macd'].ewm(span=9, adjust=False).mean()
+    
+    # ATR for Stop Loss
+    high_low = df['high'] - df['low']
+    high_close = np.abs(df['high'] - df['close'].shift())
+    low_close = np.abs(df['low'] - df['close'].shift())
+    df['atr'] = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1).rolling(14).mean()
+    
     return df.dropna()
 
 # =========================================================================
-# === CORE ANALYSIS LOOP ===
+# === PROFESSIONAL MESSAGE FORMATTER ===
 # =========================================================================
 
-async def send_telegram(symbol, msg):
-    try: await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode='HTML')
-    except: pass
-
-def run_analysis_cycle():
-    global latest_signals, bot_stats
-    print(f"🔄 Cycle Start: {datetime.now().strftime('%H:%M:%S')}")
-    bot_stats['last_run'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    bot_stats['status'] = "Scanning Markets..."
+def format_signal_message(symbol, signal, price, rsi, trend, tp1, tp2, sl):
+    """Creates a beautiful, high-end signal card for Telegram."""
     
+    # Emoji & Color Logic
+    if "STRONG BUY" in signal:
+        header = "💎 <b>PREMIUM BUY SIGNAL</b>"
+        action = f"🚀 <b>LONG {symbol}</b>"
+        color_line = "🟢🟢🟢🟢🟢🟢🟢🟢"
+    elif "STRONG SELL" in signal:
+        header = "💎 <b>PREMIUM SELL SIGNAL</b>"
+        action = f"🔻 <b>SHORT {symbol}</b>"
+        color_line = "🔴🔴🔴🔴🔴🔴🔴🔴"
+    else:
+        return None # We don't send weak signals automatically
+
+    fmt = ",.2f" if "JPY" in symbol or "XAU" in symbol else ",.4f"
+
+    msg = (
+        f"{header}\n"
+        f"{color_line}\n\n"
+        f"{action}\n"
+        f"💵 <b>Price:</b> <code>{price:{fmt}}</code>\n\n"
+        f"<b>📊 TECHNICALS</b>\n"
+        f"• Trend: <b>{trend}</b>\n"
+        f"• RSI: <code>{rsi:.1f}</code>\n"
+        f"• Momentum: {'Bullish' if 'BUY' in signal else 'Bearish'}\n\n"
+        f"<b>🎯 TRADE TARGETS</b>\n"
+        f"✅ <b>TP 1:</b> <code>{tp1:{fmt}}</code>\n"
+        f"🚀 <b>TP 2:</b> <code>{tp2:{fmt}}</code>\n"
+        f"🛡️ <b>Stop Loss:</b> <code>{sl:{fmt}}</code>\n\n"
+        f"{color_line}\n"
+        f"<i>Nilesh Quant System V11</i>"
+    )
+    return msg
+
+# =========================================================================
+# === ANALYSIS ENGINE ===
+# =========================================================================
+
+async def run_analysis_cycle(context: ContextTypes.DEFAULT_TYPE = None):
+    """Scans all pairs. Sends Alerts for STRONG signals. Saves status for /report."""
+    global market_status
+    print(f"🔄 Scanning Markets... {datetime.now()}")
+    
+    # Initialize the bot object if running from scheduler
+    bot_sender = Bot(token=TELEGRAM_BOT_TOKEN) if context is None else context.bot
+
     for symbol in WATCHLIST:
         try:
             df = fetch_data(symbol)
@@ -121,203 +158,100 @@ def run_analysis_cycle():
             else: score -= 0.5
 
             # Determine Signal
-            signal = "WAIT"
-            color = "secondary" # Grey
-            if score >= 2.5: signal, color = "STRONG BUY", "success" # Green
-            elif 1.0 <= score < 2.5: signal, color = "BUY", "info" # Blue
-            elif -2.5 < score <= -1.0: signal, color = "SELL", "warning" # Orange
-            elif score <= -2.5: signal, color = "STRONG SELL", "danger" # Red
+            signal = "WAIT (Neutral)"
+            if score >= 2.5: signal = "STRONG BUY"
+            elif 1.0 <= score < 2.5: signal = "BUY"
+            elif -2.5 < score <= -1.0: signal = "SELL"
+            elif score <= -2.5: signal = "STRONG SELL"
 
-            # Save to Global Dictionary for Website
-            latest_signals[symbol] = {
-                "price": f"{price:,.2f}" if "JPY" in symbol or "XAU" in symbol else f"{price:,.4f}",
-                "signal": signal,
-                "score": score,
-                "color": color,
-                "trend": "Bullish" if price > last['ema_200'] else "Bearish",
-                "rsi": f"{rsi:.1f}",
-                "updated": datetime.now().strftime("%H:%M")
-            }
+            # Targets
+            tp1 = cpr['R1'] if score > 0 else cpr['S1']
+            tp2 = cpr['R2'] if score > 0 else cpr['S2']
+            sl = price - (last['atr'] * 1.5) if score > 0 else price + (last['atr'] * 1.5)
+            trend = "Bullish 📈" if price > last['ema_200'] else "Bearish 📉"
 
-            # Only send Telegram if it's a STRONG signal
-            if "STRONG" in signal:
-                msg = f"🚨 <b>{signal} {symbol}</b>\nPrice: {price}\nRSI: {rsi:.1f}"
-                asyncio.run(send_telegram(symbol, msg))
+            # 1. SAVE STATUS (For /report command)
+            market_status[symbol] = f"{signal} | RSI: {rsi:.0f}"
 
-            time.sleep(8) # Respect API limits
+            # 2. SEND ALERT (Only if STRONG)
+            msg = format_signal_message(symbol, signal, price, rsi, trend, tp1, tp2, sl)
+            if msg:
+                print(f"🚨 Sending Signal for {symbol}")
+                await bot_sender.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode='HTML')
+
+            time.sleep(8) # Wait to avoid API ban
 
         except Exception as e:
-            print(f"Error {symbol}: {e}")
-
-    bot_stats['status'] = "Idle (Next Scan in 30m)"
+            print(f"❌ Error {symbol}: {e}")
 
 # =========================================================================
-# === PROFESSIONAL DASHBOARD UI (HTML/CSS) ===
+# === TELEGRAM COMMAND HANDLERS ===
 # =========================================================================
 
-DASHBOARD_HTML = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Nilesh Pro Trader</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
-    <style>
-        body {
-            background-color: #0f172a; /* Dark Navy */
-            color: #e2e8f0;
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-        }
-        .navbar {
-            background-color: #1e293b;
-            border-bottom: 1px solid #334155;
-        }
-        .card {
-            background-color: #1e293b; /* Card BG */
-            border: 1px solid #334155;
-            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.5);
-            transition: transform 0.2s;
-        }
-        .card:hover {
-            transform: translateY(-5px);
-            border-color: #64748b;
-        }
-        .status-badge {
-            font-size: 0.8em;
-            padding: 5px 10px;
-            border-radius: 20px;
-        }
-        .price-text {
-            font-size: 1.5em;
-            font-weight: bold;
-            color: #f8fafc;
-        }
-        .signal-box {
-            text-align: center;
-            padding: 10px;
-            border-radius: 5px;
-            font-weight: bold;
-            margin-top: 10px;
-        }
-        /* Custom Colors based on Bootstrap classes */
-        .bg-success-subtle { background-color: rgba(22, 163, 74, 0.2) !important; color: #4ade80; }
-        .bg-danger-subtle { background-color: rgba(220, 38, 38, 0.2) !important; color: #f87171; }
-        .bg-warning-subtle { background-color: rgba(234, 179, 8, 0.2) !important; color: #facc15; }
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("👋 <b>Nilesh Bot Online!</b>\nType /report to see all pairs.", parse_mode='HTML')
+
+async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sends a summary of ALL pairs when user types /report"""
+    if not market_status:
+        await update.message.reply_text("⏳ collecting data... try again in 1 minute.")
+        return
+
+    msg = "📊 <b>LIVE MARKET REPORT</b>\n\n"
+    for sym, status in market_status.items():
+        icon = "⚪"
+        if "STRONG BUY" in status: icon = "🟢"
+        elif "STRONG SELL" in status: icon = "🔴"
+        elif "BUY" in status: icon = "🔹"
+        elif "SELL" in status: icon = "🔸"
         
-        .refresh-timer {
-            font-size: 0.8rem;
-            color: #94a3b8;
-        }
-    </style>
-    <script>
-        // Auto-refresh page every 30 seconds to show new data
-        setTimeout(function(){
-           window.location.reload(1);
-        }, 30000);
-    </script>
-</head>
-<body>
+        msg += f"{icon} <b>{sym}:</b> {status}\n"
+    
+    msg += "\n<i>Updated just now.</i>"
+    await update.message.reply_text(msg, parse_mode='HTML')
 
-    <nav class="navbar navbar-dark mb-4">
-        <div class="container-fluid">
-            <span class="navbar-brand mb-0 h1">
-                <i class="fa-solid fa-robot me-2"></i> Nilesh AI Trader <span class="badge bg-primary ms-2">PRO</span>
-            </span>
-            <span class="text-light small">
-                Status: <span class="text-success">{{ stats.status }}</span> | 
-                Last Update: {{ stats.last_run }}
-            </span>
-        </div>
-    </nav>
+# =========================================================================
+# === MAIN EXECUTION ===
+# =========================================================================
 
-    <div class="container">
-        
-        <div class="row mb-4">
-            <div class="col-md-12 text-center">
-                <h4 class="text-light">Live Market Scanner</h4>
-                <p class="refresh-timer"><i class="fa-solid fa-sync fa-spin me-1"></i> Auto-refreshing every 30s</p>
-            </div>
-        </div>
+app_flask = Flask(__name__)
 
-        <div class="row g-4">
-            {% for symbol, data in signals.items() %}
-            <div class="col-12 col-md-6 col-lg-3">
-                <div class="card h-100">
-                    <div class="card-header d-flex justify-content-between align-items-center">
-                        <span class="fw-bold">{{ symbol }}</span>
-                        <span class="badge bg-dark">{{ data.updated }}</span>
-                    </div>
-                    <div class="card-body">
-                        <div class="d-flex justify-content-between align-items-end mb-3">
-                            <div>
-                                <small class="text-muted">Current Price</small>
-                                <div class="price-text">{{ data.price }}</div>
-                            </div>
-                            <div class="text-end">
-                                <small class="text-muted">RSI</small>
-                                <div class="fw-bold {{ 'text-danger' if data.rsi|float > 70 else 'text-success' if data.rsi|float < 30 else 'text-light' }}">
-                                    {{ data.rsi }}
-                                </div>
-                            </div>
-                        </div>
-
-                        <div class="signal-box bg-{{ data.color }} text-dark bg-opacity-75">
-                            {{ data.signal }}
-                        </div>
-
-                        <div class="mt-3 d-flex justify-content-between small text-muted">
-                            <span>Trend: 
-                                <span class="{{ 'text-success' if data.trend == 'Bullish' else 'text-danger' }}">
-                                    {{ data.trend }}
-                                </span>
-                            </span>
-                            <span>Score: {{ data.score }}</span>
-                        </div>
-                    </div>
-                </div>
-            </div>
-            {% else %}
-            <div class="col-12 text-center py-5">
-                <div class="spinner-border text-primary" role="status"></div>
-                <p class="mt-3">Collecting market data... Please wait 30 seconds.</p>
-            </div>
-            {% endfor %}
-        </div>
-        
-        <div class="row mt-5">
-            <div class="col-12 text-center text-muted small">
-                <p>Powered by Nilesh System V10 | TwelveData API</p>
-            </div>
-        </div>
-
-    </div>
-
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
-</body>
-</html>
-"""
-
-app = Flask(__name__)
-
-@app.route('/')
+@app_flask.route('/')
 def home():
-    # Pass the global data to the HTML template
-    return render_template_string(DASHBOARD_HTML, signals=latest_signals, stats=bot_stats)
+    return "Nilesh Bot V11 - Telegram Interface Active"
 
-def startup():
-    asyncio.run(bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚀 <b>WEB DASHBOARD ONLINE</b>"))
-    run_analysis_cycle()
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app_flask.run(host='0.0.0.0', port=port)
 
-def start_bot():
+def main():
+    # 1. Start Web Server (Background)
+    threading.Thread(target=run_flask).start()
+    
+    # 2. Setup Telegram Application
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    # 3. Add Commands
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("report", report_command))
+    
+    # 4. Setup Scheduler for Auto-Analysis
     scheduler = BackgroundScheduler()
-    scheduler.add_job(run_analysis_cycle, 'interval', minutes=30)
+    scheduler.add_job(lambda: asyncio.run(run_analysis_cycle()), 'interval', minutes=30)
     scheduler.start()
-    threading.Thread(target=startup).start()
+    
+    # 5. Send Startup Message
+    asyncio.get_event_loop().run_until_complete(
+        application.bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID, 
+            text="🚀 <b>SYSTEM RESTARTED</b>\n\nType <code>/report</code> to check all pairs immediately.", 
+            parse_mode='HTML'
+        )
+    )
 
-start_bot()
+    # 6. Run Bot
+    print("🚀 Bot Polling Started...")
+    application.run_polling()
 
 if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+    main()
