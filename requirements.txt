@@ -1,8 +1,8 @@
+flask
+gunicorn
+python-telegram-bot
 ccxt
 pandas
 numpy
-APScheduler
-python-telegram-bot
-Flask
+apscheduler
 python-dotenv
-gunicorn
