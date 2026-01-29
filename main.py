@@ -10,7 +10,7 @@ from datetime import datetime
 from apscheduler.schedulers.background import BackgroundScheduler
 from telegram import Bot, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-from flask import Flask, render_template_string
+from flask import Flask
 
 # --- CONFIGURATION ---
 from dotenv import load_dotenv
@@ -167,91 +167,4 @@ async def run_analysis_cycle(context: ContextTypes.DEFAULT_TYPE = None):
             # Targets
             tp1 = cpr['R1'] if score > 0 else cpr['S1']
             tp2 = cpr['R2'] if score > 0 else cpr['S2']
-            sl = price - (last['atr'] * 1.5) if score > 0 else price + (last['atr'] * 1.5)
-            trend = "Bullish 📈" if price > last['ema_200'] else "Bearish 📉"
-
-            # 1. SAVE STATUS (For /report command)
-            market_status[symbol] = f"{signal} | RSI: {rsi:.0f}"
-
-            # 2. SEND ALERT (Only if STRONG)
-            msg = format_signal_message(symbol, signal, price, rsi, trend, tp1, tp2, sl)
-            if msg:
-                print(f"🚨 Sending Signal for {symbol}")
-                await bot_sender.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode='HTML')
-
-            time.sleep(8) # Wait to avoid API ban
-
-        except Exception as e:
-            print(f"❌ Error {symbol}: {e}")
-
-# =========================================================================
-# === TELEGRAM COMMAND HANDLERS ===
-# =========================================================================
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 <b>Nilesh Bot Online!</b>\nType /report to see all pairs.", parse_mode='HTML')
-
-async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Sends a summary of ALL pairs when user types /report"""
-    if not market_status:
-        await update.message.reply_text("⏳ collecting data... try again in 1 minute.")
-        return
-
-    msg = "📊 <b>LIVE MARKET REPORT</b>\n\n"
-    for sym, status in market_status.items():
-        icon = "⚪"
-        if "STRONG BUY" in status: icon = "🟢"
-        elif "STRONG SELL" in status: icon = "🔴"
-        elif "BUY" in status: icon = "🔹"
-        elif "SELL" in status: icon = "🔸"
-        
-        msg += f"{icon} <b>{sym}:</b> {status}\n"
-    
-    msg += "\n<i>Updated just now.</i>"
-    await update.message.reply_text(msg, parse_mode='HTML')
-
-# =========================================================================
-# === MAIN EXECUTION ===
-# =========================================================================
-
-app_flask = Flask(__name__)
-
-@app_flask.route('/')
-def home():
-    return "Nilesh Bot V11 - Telegram Interface Active"
-
-def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    app_flask.run(host='0.0.0.0', port=port)
-
-def main():
-    # 1. Start Web Server (Background)
-    threading.Thread(target=run_flask).start()
-    
-    # 2. Setup Telegram Application
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    
-    # 3. Add Commands
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("report", report_command))
-    
-    # 4. Setup Scheduler for Auto-Analysis
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(lambda: asyncio.run(run_analysis_cycle()), 'interval', minutes=30)
-    scheduler.start()
-    
-    # 5. Send Startup Message
-    asyncio.get_event_loop().run_until_complete(
-        application.bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID, 
-            text="🚀 <b>SYSTEM RESTARTED</b>\n\nType <code>/report</code> to check all pairs immediately.", 
-            parse_mode='HTML'
-        )
-    )
-
-    # 6. Run Bot
-    print("🚀 Bot Polling Started...")
-    application.run_polling()
-
-if __name__ == '__main__':
-    main()
+            sl = price - (last['atr'] * 1.5) if score > 0 else price
