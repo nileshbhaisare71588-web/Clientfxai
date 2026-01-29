@@ -1,12 +1,10 @@
 import os
+import requests
 import pandas as pd
 import numpy as np
 import asyncio
 import time
-import random
 import traceback
-import yfinance as yf
-import requests
 from datetime import datetime
 from apscheduler.schedulers.background import BackgroundScheduler
 from telegram import Bot
@@ -20,253 +18,251 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# --- ASSETS (Yahoo Tickers) ---
-ASSET_MAP = {
-    "GBP/JPY": "GBPJPY=X",
-    "AUD/CAD": "AUDCAD=X",
-    "XAU/USD": "GC=F"
-}
+# 🟢 PASTE YOUR TWELVEDATA API KEY HERE
+# If you don't use a .env file, replace os.getenv(...) with your actual key string
+TD_API_KEY = os.getenv("TD_API_KEY", "YOUR_API_KEY_HERE")
 
-WATCHLIST = list(ASSET_MAP.keys())
+# --- ASSETS ---
+# All 8 pairs you requested. TwelveData uses standard format "Base/Quote"
+WATCHLIST = [
+    "EUR/USD",
+    "GBP/JPY",
+    "AUD/USD",
+    "GBP/USD",
+    "XAU/USD",  # Gold
+    "AUD/CAD",
+    "AUD/JPY",
+    "BTC/USD"
+]
+
+TIMEFRAME = "1h"  # Using 1H for reliable intraday signals
 
 # Initialize Bot
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
-
 bot_stats = {
-    "status": "initializing",
-    "total_analyses": 0,
-    "last_analysis": None,
-    "version": "V7.0 Debug Edition"
+    "status": "running", 
+    "last_run": "Waiting...", 
+    "version": "V9.0 TwelveData Pro"
 }
 
 # =========================================================================
-# === INDICATOR ENGINE ===
+# === DATA ENGINE (TwelveData) ===
 # =========================================================================
 
-def calculate_cpr(df):
+def fetch_data(symbol):
+    """Fetches clean data from TwelveData API."""
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol": symbol,
+        "interval": TIMEFRAME,
+        "apikey": TD_API_KEY,
+        "outputsize": 100
+    }
+    
     try:
+        response = requests.get(url, params=params)
+        data = response.json()
+
+        # Check for API errors (e.g., Rate Limit)
+        if "code" in data and data["code"] == 429:
+            print(f"⚠️ Rate Limit Hit for {symbol}. Skipping...")
+            return pd.DataFrame()
+        
+        if "values" not in data:
+            print(f"❌ API Error for {symbol}: {data.get('message', 'Unknown')}")
+            return pd.DataFrame()
+
+        # Convert to DataFrame
+        df = pd.DataFrame(data["values"])
+        df['datetime'] = pd.to_datetime(df['datetime'])
+        df.set_index('datetime', inplace=True)
+        
+        # Sort: Oldest first (Crucial for indicators)
+        df = df.iloc[::-1]
+        
+        # Convert strings to floats
+        cols = ['open', 'high', 'low', 'close']
+        df[cols] = df[cols].astype(float)
+        
+        return add_indicators(df)
+
+    except Exception as e:
+        print(f"❌ Connection Error {symbol}: {e}")
+        return pd.DataFrame()
+
+def calculate_cpr(df):
+    """Calculates Pivot Points."""
+    try:
+        # Aggregate to Daily
         df_daily = df.resample('D').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'}).dropna()
         if len(df_daily) < 2: return None
+        
         prev_day = df_daily.iloc[-2]
         H, L, C = prev_day['high'], prev_day['low'], prev_day['close']
         PP = (H + L + C) / 3.0
         BC = (H + L) / 2.0
         TC = PP - BC + PP
+        
         return {
-            'PP': PP, 'TC': TC, 'BC': BC,
+            'PP': PP, 
             'R1': 2*PP - L, 'S1': 2*PP - H,
-            'R2': PP + (H - L), 'S2': PP - (H - L)
+            'R2': PP + (H-L), 'S2': PP - (H-L)
         }
     except: return None
 
 def add_indicators(df):
+    """Adds EMA, RSI, MACD, ATR."""
     if df.empty: return df
+    
+    # 1. EMA Trend
     df['ema_50'] = df['close'].ewm(span=50, adjust=False).mean()
     df['ema_200'] = df['close'].ewm(span=200, adjust=False).mean()
     
+    # 2. RSI (14)
     delta = df['close'].diff()
     up = delta.clip(lower=0)
     down = -1 * delta.clip(upper=0)
     rs = up.ewm(com=13, adjust=False).mean() / down.ewm(com=13, adjust=False).mean()
     df['rsi'] = 100 - (100 / (1 + rs))
     
+    # 3. MACD
     exp1 = df['close'].ewm(span=12, adjust=False).mean()
     exp2 = df['close'].ewm(span=26, adjust=False).mean()
     df['macd'] = exp1 - exp2
     df['signal_line'] = df['macd'].ewm(span=9, adjust=False).mean()
     
-    df['bb_middle'] = df['close'].rolling(window=20).mean()
-    df['bb_std'] = df['close'].rolling(window=20).std()
-    df['bb_upper'] = df['bb_middle'] + (2 * df['bb_std'])
-    df['bb_lower'] = df['bb_middle'] - (2 * df['bb_std'])
+    # 4. Bollinger Bands
+    df['bb_upper'] = df['close'].rolling(20).mean() + (df['close'].rolling(20).std() * 2)
+    df['bb_lower'] = df['close'].rolling(20).mean() - (df['close'].rolling(20).std() * 2)
     
+    # 5. ATR (For Stop Loss)
     high_low = df['high'] - df['low']
     high_close = np.abs(df['high'] - df['close'].shift())
     low_close = np.abs(df['low'] - df['close'].shift())
-    ranges = pd.concat([high_low, high_close, low_close], axis=1)
-    df['atr'] = np.max(ranges, axis=1).rolling(14).mean()
+    df['atr'] = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1).rolling(14).mean()
+    
     return df.dropna()
 
-def get_session():
-    """Creates a browser-like session to bypass Yahoo blocks."""
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-    })
-    return session
+# =========================================================================
+# === ANALYSIS & TELEGRAM ===
+# =========================================================================
 
-def fetch_data(symbol_name):
-    """Fetches data with session handling and explicit error reporting."""
-    ticker = ASSET_MAP.get(symbol_name)
-    print(f"📥 Fetching {symbol_name} ({ticker})...")
+async def send_signal(symbol, message):
+    try:
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode='HTML')
+        print(f"✅ Signal Sent for {symbol}")
+    except Exception as e:
+        print(f"⚠️ Telegram Error: {e}")
+
+def run_analysis_cycle():
+    """Iterates through all pairs sequentially to respect Rate Limits."""
+    print(f"🔄 Starting Analysis Cycle: {datetime.now()}")
+    bot_stats['last_run'] = datetime.now().isoformat()
     
-    try:
-        # Use Ticker object with session for better reliability
-        # Fetch 1 month of 1h data
-        dat = yf.Ticker(ticker, session=get_session())
-        df = dat.history(period="1mo", interval="1h")
-        
-        if df.empty:
-            print(f"⚠️ Data Empty for {symbol_name}")
-            return pd.DataFrame(), "Empty Data (Yahoo might be blocking IP)"
+    for symbol in WATCHLIST:
+        try:
+            print(f"🔍 Checking {symbol}...")
+            
+            # 1. Fetch
+            df = fetch_data(symbol)
+            if df.empty: 
+                time.sleep(10) # Wait before next even if fail
+                continue
 
-        # Clean columns
-        df.columns = df.columns.str.lower()
-        # Rename standard Yahoo columns to our format if needed
-        if 'stock splits' in df.columns: df = df.drop(columns=['stock splits', 'dividends'])
-        
-        df = add_indicators(df)
-        return df, None
+            # 2. Logic
+            cpr = calculate_cpr(df)
+            if not cpr: continue
 
-    except Exception as e:
-        error_msg = str(e)
-        print(f"❌ Error {symbol_name}: {error_msg}")
-        return pd.DataFrame(), error_msg
+            last = df.iloc[-1]
+            price = last['close']
+            
+            # --- SCORING SYSTEM ---
+            score = 0
+            # Trend
+            if price > last['ema_200']: score += 1
+            else: score -= 1
+            
+            # Momentum
+            if last['macd'] > last['signal_line']: score += 1
+            else: score -= 1
+            
+            # RSI
+            rsi = last['rsi']
+            if 50 < rsi < 70: score += 0.5
+            elif rsi < 30: score += 0.5
+            elif rsi > 70: score -= 0.5
+            elif 30 < rsi < 50: score -= 0.5
+            
+            # CPR
+            if price > cpr['PP']: score += 0.5
+            else: score -= 0.5
 
-def resample_to_4h(df_1h):
-    try:
-        agg_dict = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'}
-        df_4h = df_1h.resample('4H').agg(agg_dict).dropna()
-        return add_indicators(df_4h)
-    except: return pd.DataFrame()
+            # --- DECISION ---
+            signal, emoji = "WAIT", "⚖️"
+            if score >= 2.5: signal, emoji = "STRONG BUY", "🚀"
+            elif 1.0 <= score < 2.5: signal, emoji = "BUY", "🟢"
+            elif -2.5 < score <= -1.0: signal, emoji = "SELL", "🔴"
+            elif score <= -2.5: signal, emoji = "STRONG SELL", "🔻"
 
-# =========================================================================
-# === ANALYZER ===
-# =========================================================================
+            # Formats
+            is_buy = score > 0
+            tp1 = cpr['R1'] if is_buy else cpr['S1']
+            tp2 = cpr['R2'] if is_buy else cpr['S2']
+            sl = price - (last['atr'] * 1.5) if is_buy else price + (last['atr'] * 1.5)
+            
+            fmt = ",.2f" if "JPY" in symbol or "XAU" in symbol else ",.4f"
+            vol_status = "⚠️ High" if (price > last['bb_upper'] or price < last['bb_lower']) else "Normal"
 
-async def send_telegram_alert(text):
-    """Sends a raw text message to Telegram (for errors/status)."""
-    try:
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
-    except Exception as e:
-        print(f"Telegram Fail: {e}")
+            # Message
+            msg = (
+                f"⚡ <b>NILESH PRO SIGNAL</b>\n"
+                f"<b>Asset:</b> {symbol}\n"
+                f"<b>Price:</b> <code>{price:{fmt}}</code>\n"
+                f"<b>Volatility:</b> {vol_status}\n\n"
+                f"🚨 <b>{emoji} {signal}</b>\n\n"
+                f"📈 <b>Trend:</b> {'Bullish' if price > last['ema_200'] else 'Bearish'}\n"
+                f"📊 <b>RSI:</b> {rsi:.1f}\n"
+                f"🎯 <b>TP1:</b> {tp1:{fmt}}\n"
+                f"🎯 <b>TP2:</b> {tp2:{fmt}}\n"
+                f"🛑 <b>SL:</b> {sl:{fmt}}"
+            )
+            
+            # Send (Async wrapper)
+            asyncio.run(send_signal(symbol, msg))
+            
+            # CRITICAL: Wait 10 seconds before next pair to respect API limit (8/min)
+            print("⏳ Waiting 10s for API limit...")
+            time.sleep(10)
 
-def analyze_market(symbol):
-    global bot_stats
-    try:
-        df_1h, error = fetch_data(symbol)
-        
-        # ERROR HANDLING: If data fails, tell the user WHY.
-        if error or df_1h.empty:
-            print(f"Skipping {symbol} due to error.")
-            # Uncomment the line below if you want to be notified of EVERY failure (can be spammy)
-            # asyncio.run(send_telegram_alert(f"⚠️ Failed to fetch {symbol}: {error}"))
-            return
-
-        df_4h = resample_to_4h(df_1h)
-        cpr = calculate_cpr(df_1h)
-        
-        if df_4h.empty or not cpr: return
-
-        last_1h = df_1h.iloc[-1]
-        last_4h = df_4h.iloc[-1]
-        price = last_1h['close']
-
-        # --- SIGNAL LOGIC ---
-        score = 0
-        if price > last_4h['ema_200']: score += 1
-        else: score -= 1
-        
-        if last_4h['macd'] > last_4h['signal_line']: score += 1
-        else: score -= 1
-
-        rsi = last_4h['rsi']
-        if 50 < rsi < 70: score += 0.5
-        elif 30 < rsi < 50: score -= 0.5
-        elif rsi > 70: score -= 0.5
-        elif rsi < 30: score += 0.5
-
-        if price > cpr['PP']: score += 0.5
-        else: score -= 0.5
-
-        vol_status = "Normal"
-        if price > last_4h['bb_upper']: vol_status = "⚠️ High (Overbought)"
-        elif price < last_4h['bb_lower']: vol_status = "⚠️ High (Oversold)"
-
-        # Signal Threshold
-        signal = "WAIT"
-        emoji = "⚖️"
-        if score >= 2.5: signal, emoji = "STRONG BUY", "🚀"
-        elif 1.0 <= score < 2.5: signal, emoji = "BUY", "🟢"
-        elif -2.5 < score <= -1.0: signal, emoji = "SELL", "🔴"
-        elif score <= -2.5: signal, emoji = "STRONG SELL", "🔻"
-
-        is_buy = score > 0
-        tp1 = cpr['R1'] if is_buy else cpr['S1']
-        tp2 = cpr['R2'] if is_buy else cpr['S2']
-        atr_sl = last_4h['atr'] * 1.5
-        sl = price - atr_sl if is_buy else price + atr_sl
-        
-        fmt = ",.2f" if "JPY" in symbol or "XAU" in symbol else ",.4f"
-
-        message = (
-            f"╔════════════════════════════════╗\n"
-            f"  🔥 <b>NILESH FOREX SIGNALS</b>\n"
-            f"╚════════════════════════════════╝\n\n"
-            f"<b>Asset:</b> {symbol}\n"
-            f"<b>Price:</b> <code>{price:{fmt}}</code>\n"
-            f"<b>Volatility:</b> {vol_status}\n\n"
-            f"--- 🚨 {emoji} <b>{signal}</b> 🚨 ---\n\n"
-            f"<b>Trend (EMA200):</b> {'UP 📈' if price > last_4h['ema_200'] else 'DOWN 📉'}\n"
-            f"<b>RSI:</b> <code>{rsi:.1f}</code>\n"
-            f"<b>Pivot:</b> {'Above' if price > cpr['PP'] else 'Below'} PP\n\n"
-            f"✅ <b>TP1:</b> <code>{tp1:{fmt}}</code>\n"
-            f"🛑 <b>SL:</b> <code>{sl:{fmt}}</code>\n\n"
-            f"<i>Nilesh System V7</i>"
-        )
-
-        asyncio.run(bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode='HTML'))
-        print(f"✅ Sent {symbol}")
-        bot_stats['total_analyses'] += 1
-        bot_stats['last_analysis'] = datetime.now().isoformat()
-
-    except Exception as e:
-        print(f"❌ Critical Error {symbol}: {e}")
-        traceback.print_exc()
+        except Exception as e:
+            print(f"❌ Cycle Error {symbol}: {e}")
+            traceback.print_exc()
 
 # =========================================================================
 # === SCHEDULER & STARTUP ===
 # =========================================================================
 
-def send_startup_message():
-    """Tells the user the bot has restarted successfully."""
-    msg = f"🚀 <b>BOT RESTARTED</b>\nMonitoring: {', '.join(WATCHLIST)}\nIf you see this, Telegram connection is working."
-    try:
-        asyncio.run(bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode='HTML'))
-    except Exception as e:
-        print(f"Startup Message Failed: {e}")
-
-def run_immediate_check():
-    """Runs one check immediately to verify data."""
-    print("⏳ Running immediate diagnostic check...")
-    for symbol in WATCHLIST:
-        analyze_market(symbol)
-        time.sleep(10) # 10s delay
+def startup_check():
+    """Runs one full cycle immediately on startup."""
+    print("🚀 Bot Started. Running immediate diagnostic cycle...")
+    asyncio.run(bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚀 <b>BOT ONLINE:</b> TwelveData Engine Active"))
+    run_analysis_cycle()
 
 def start_bot():
-    print(f"🚀 Initializing {bot_stats['version']}...")
-    
-    # 1. Send Startup Message
-    threading.Thread(target=send_startup_message).start()
-    
-    # 2. Start Scheduler
     scheduler = BackgroundScheduler()
-    # Schedule every 30 mins, staggered
-    scheduler.add_job(analyze_market, 'cron', minute='0,30', args=["GBP/JPY"])
-    scheduler.add_job(analyze_market, 'cron', minute='15,45', args=["AUD/CAD"])
-    scheduler.add_job(analyze_market, 'cron', minute='10,40', args=["XAU/USD"])
+    # Run the full cycle every 30 minutes
+    scheduler.add_job(run_analysis_cycle, 'interval', minutes=30)
     scheduler.start()
     
-    # 3. Run Immediate Check
-    threading.Thread(target=run_immediate_check).start()
+    # Run startup in separate thread
+    threading.Thread(target=startup_check).start()
 
 start_bot()
 
 app = Flask(__name__)
-
 @app.route('/')
 def home():
-    return render_template_string(f"<h1>Nilesh Bot V7</h1><p>Status: Running</p>")
+    return render_template_string("<h1>Nilesh Bot Active</h1><p>Status: Running V9</p>")
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
