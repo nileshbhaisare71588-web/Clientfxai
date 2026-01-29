@@ -205,7 +205,7 @@ def generate_and_send_signal(symbol, force_send=False):
             zone_txt = "None"
 
         message = (
-            f"<b>💎 PREMIUM QUANT SIGNAL</b>\n"
+            f"<b>💎 PREMIUM AI SIGNAL</b>\n"
             f"──────────────────────\n"
             f"<b>🪙 ASSET:</b> #{symbol.replace('/','')}\n"
             f"<b>💵 PRICE:</b> <code>{current_price:.{dec}f}</code>\n"
@@ -274,4 +274,5 @@ def health(): return jsonify({"status": "healthy"}), 200
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
+
 
