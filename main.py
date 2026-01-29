@@ -81,7 +81,6 @@ def format_signal_message(symbol, signal, price, rsi, trend, tp1, tp2, sl):
     """
     Generates a high-end, professional signal card.
     """
-    is_buy = "BUY" in signal
     
     # 1. HEADER & COLORS
     if "STRONG BUY" in signal:
