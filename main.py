@@ -1,4 +1,4 @@
-# main.py - PREMIER FOREX AI QUANT V2.6 (High Win-Ratio Optimized)
+# main.py - PREMIER FOREX AI QUANT V2.7 (Stability Fixed)
 
 import os
 import ccxt
@@ -11,6 +11,7 @@ from telegram import Bot
 from flask import Flask, jsonify, render_template_string
 import threading
 import time
+import traceback
 
 # --- CONFIGURATION ---
 from dotenv import load_dotenv 
@@ -20,12 +21,9 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 FOREX_PAIRS = [p.strip() for p in os.getenv("FOREX_PAIRS", "EUR/USD,GBP/USD,USD/JPY,AUD/USD").split(',')]
 
-# TIMEFRAMES FOR CONFLUENCE
-TIMEFRAME_HTF = "4h"  # Market Structure / Direction
-TIMEFRAME_LTF = "1h"  # Entry / FVG Detection
+TIMEFRAME_HTF = "4h"
+TIMEFRAME_LTF = "1h"
 
-# Initialize Bot and Exchange
-bot = Bot(token=TELEGRAM_BOT_TOKEN)
 exchange = ccxt.kraken({
     'enableRateLimit': True, 
     'rateLimit': 2000,
@@ -36,15 +34,26 @@ bot_stats = {
     "status": "initializing",
     "total_analyses": 0,
     "last_analysis": None,
-    "version": "V2.6 Quant Elite"
+    "version": "V2.7 Stable"
 }
 
 # =========================================================================
-# === ADVANCED ANALYTICAL ENGINES ===
+# === HELPER: ASYNC TELEGRAM SENDER (FIXES CRASH) ===
+# =========================================================================
+
+async def send_telegram_message(message):
+    """
+    Initializes a fresh bot instance for every message to avoid 
+    'Event Loop Closed' errors in threaded environments.
+    """
+    async with Bot(token=TELEGRAM_BOT_TOKEN) as bot:
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode='HTML')
+
+# =========================================================================
+# === ANALYTICAL ENGINES (FIXES FLOAT DISPLAY) ===
 # =========================================================================
 
 def calculate_atr(df, period=14):
-    """Calculates Volatility (ATR) for dynamic Stop Loss."""
     high_low = df['high'] - df['low']
     high_close = np.abs(df['high'] - df['close'].shift())
     low_close = np.abs(df['low'] - df['close'].shift())
@@ -52,60 +61,51 @@ def calculate_atr(df, period=14):
     true_range = np.max(ranges, axis=1)
     return true_range.rolling(period).mean()
 
-def detect_structure(df, window=3):
-    """
-    Determines Market Structure (BOS) using Fractal Highs/Lows.
-    Returns: 'BULLISH' if making Higher Highs, 'BEARISH' if Lower Lows.
-    """
-    # Identify Fractals (Local peaks/valleys)
+def detect_structure(df):
     df['is_high'] = df['high'][(df['high'].shift(1) < df['high']) & (df['high'].shift(-1) < df['high'])]
     df['is_low'] = df['low'][(df['low'].shift(1) > df['low']) & (df['low'].shift(-1) > df['low'])]
     
     last_highs = df['is_high'].dropna().tail(2)
     last_lows = df['is_low'].dropna().tail(2)
     
-    if len(last_highs) < 2 or len(last_lows) < 2:
-        return "NEUTRAL"
+    if len(last_highs) < 2 or len(last_lows) < 2: return "NEUTRAL"
     
-    # Check for Higher Highs (HH) vs Lower Lows (LL)
-    structure = "NEUTRAL"
     if last_highs.iloc[-1] > last_highs.iloc[-2] and last_lows.iloc[-1] > last_lows.iloc[-2]:
-        structure = "BULLISH" # Uptrend
+        return "BULLISH"
     elif last_highs.iloc[-1] < last_highs.iloc[-2] and last_lows.iloc[-1] < last_lows.iloc[-2]:
-        structure = "BEARISH" # Downtrend
+        return "BEARISH"
         
-    return structure
+    return "NEUTRAL"
 
 def detect_fvg(df):
     """
-    Scans for the most recent Bullish or Bearish Fair Value Gap (FVG).
-    Logic: Gap between Candle i-1 High and Candle i+1 Low.
+    Scans for FVG and converts numpy types to standard floats
+    to fix the 'np.float64' text error.
     """
-    # We look at the last 5 closed candles for a fresh FVG
     recent_data = df.iloc[-6:-1] 
-    
     fvg_zone = None
     fvg_type = None
     
     for i in range(len(recent_data) - 2):
-        # Bullish FVG (Gap up)
-        curr_high = recent_data.iloc[i]['high']
-        next_low = recent_data.iloc[i+2]['low']
+        # Bullish FVG
+        curr_high = float(recent_data.iloc[i]['high']) # <--- Explicit float conversion
+        next_low = float(recent_data.iloc[i+2]['low']) # <--- Explicit float conversion
+        
         if next_low > curr_high:
-            fvg_zone = (curr_high, next_low) # The gap range
+            fvg_zone = (curr_high, next_low)
             fvg_type = "BULLISH_FVG"
             
-        # Bearish FVG (Gap down)
-        curr_low = recent_data.iloc[i]['low']
-        next_high = recent_data.iloc[i+2]['high']
+        # Bearish FVG
+        curr_low = float(recent_data.iloc[i]['low'])
+        next_high = float(recent_data.iloc[i+2]['high'])
+        
         if next_high < curr_low:
-            fvg_zone = (next_high, curr_low) # The gap range
+            fvg_zone = (next_high, curr_low)
             fvg_type = "BEARISH_FVG"
             
     return fvg_type, fvg_zone
 
 def fetch_data_safe(symbol, timeframe):
-    """Robust fetcher with retries."""
     max_retries = 3
     for attempt in range(max_retries):
         try:
@@ -121,61 +121,53 @@ def fetch_data_safe(symbol, timeframe):
     return pd.DataFrame()
 
 # =========================================================================
-# === MASTER LOGIC: CONFLUENCE V2.6 ===
+# === MASTER LOGIC ===
 # =========================================================================
 
 def generate_and_send_signal(symbol):
     global bot_stats
     try:
-        # 1. Fetch Multi-Timeframe Data
-        df_htf = fetch_data_safe(symbol, TIMEFRAME_HTF) # 4H (Structure)
-        df_ltf = fetch_data_safe(symbol, TIMEFRAME_LTF) # 1H (Entry/FVG)
+        df_htf = fetch_data_safe(symbol, TIMEFRAME_HTF)
+        df_ltf = fetch_data_safe(symbol, TIMEFRAME_LTF)
         
         if df_htf.empty or df_ltf.empty: return
 
-        # 2. Run Analysis Modules
-        current_price = df_ltf.iloc[-1]['close']
-        
-        # A. Market Structure (HTF)
+        current_price = float(df_ltf.iloc[-1]['close'])
         structure_htf = detect_structure(df_htf)
         
-        # B. Volatility (ATR)
         df_ltf['atr'] = calculate_atr(df_ltf)
-        current_atr = df_ltf.iloc[-1]['atr']
-        volatility_pips = current_atr / 0.0001 # Convert to pips roughly
+        current_atr = float(df_ltf.iloc[-1]['atr']) # Explicit float
+        volatility_pips = current_atr / 0.0001
         
-        # C. Supply/Demand (FVG Detection on LTF)
         fvg_type, fvg_zone = detect_fvg(df_ltf)
         
-        # 3. Decision Logic (The "Confluence")
+        # Format the zone text cleanly
+        if fvg_zone:
+            zone_text = f"{fvg_zone[0]:.4f} - {fvg_zone[1]:.4f}"
+        else:
+            zone_text = "None detected"
+
+        # Signal Logic
         signal = "HOLD / NEUTRAL"
         emoji = "⚖️"
         stop_loss = 0.0
         take_profit = 0.0
         
-        # BUY SCENARIO: Bullish Structure + Price near Bullish FVG
         if structure_htf == "BULLISH":
-            # If we are in a Bullish Trend, we look for buys
-            signal = "BUY BIAS (Wait for Entry)"
+            signal = "BUY BIAS"
             emoji = "🐂"
-            
-            # Strong Signal if we have a Bullish FVG or Momentum
             if fvg_type == "BULLISH_FVG":
                 signal = "STRONG BUY"
                 emoji = "🚀"
-                # SL placed below the FVG or 1.5x ATR
                 stop_loss = current_price - (1.5 * current_atr)
-                take_profit = current_price + (3.0 * current_atr) # 1:2 Risk Reward
+                take_profit = current_price + (3.0 * current_atr)
             else:
-                # Standard Trend Follow
                 stop_loss = current_price - (2.0 * current_atr)
                 take_profit = current_price + (2.0 * current_atr)
 
-        # SELL SCENARIO: Bearish Structure + Price near Bearish FVG
         elif structure_htf == "BEARISH":
-            signal = "SELL BIAS (Wait for Entry)"
+            signal = "SELL BIAS"
             emoji = "🐻"
-            
             if fvg_type == "BEARISH_FVG":
                 signal = "STRONG SELL"
                 emoji = "🔻"
@@ -187,36 +179,33 @@ def generate_and_send_signal(symbol):
 
         decimals = 3 if 'JPY' in symbol else 5
         
-        # Only send if it's not Neutral
-        # (You can remove this check if you want updates every time)
-        
         message = (
             f"╔══════════════════════════╗\n"
-            f"  🤖 <b>FOREX QUANT ELITE V2.6</b>\n"
+            f"  🤖 <b>FOREX QUANT ELITE V2.7</b>\n"
             f"╚══════════════════════════╝\n\n"
             f"<b>Pair:</b> {symbol}\n"
             f"<b>Price:</b> <code>{current_price:.{decimals}f}</code>\n"
-            f"<b>Volatility:</b> {volatility_pips:.1f} pips (ATR)\n\n"
+            f"<b>Volatility:</b> {volatility_pips:.1f} pips\n\n"
             f"--- 🚨 {emoji} <b>FINAL CALL: {signal}</b> 🚨 ---\n\n"
             f"<b>📊 DEEP ANALYSIS:</b>\n"
-            f"• <b>Market Structure (4H):</b> {structure_htf}\n"
-            f"• <b>Smart Money (1H):</b> {fvg_type if fvg_type else 'No Recent FVG'}\n"
-            f"• <b>Important Level:</b> {fvg_zone if fvg_zone else 'None detected'}\n\n"
+            f"• <b>Structure (4H):</b> {structure_htf}\n"
+            f"• <b>Smart Money (1H):</b> {fvg_type if fvg_type else 'No FVG'}\n"
+            f"• <b>Key Zone:</b> <code>{zone_text}</code>\n\n"
             f"<b>🛡️ RISK MANAGEMENT:</b>\n"
             f"🛑 <b>Stop Loss:</b> <code>{stop_loss:.{decimals}f}</code>\n"
-            f"💰 <b>Take Profit:</b> <code>{take_profit:.{decimals}f}</code>\n"
-            f"<i>(Calculated via 1.5x Volatility ATR)</i>\n\n"
+            f"💰 <b>Take Profit:</b> <code>{take_profit:.{decimals}f}</code>\n\n"
             f"------------------------------\n"
         )
 
-        asyncio.run(bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode='HTML'))
+        # FIXED: Use the new async sender function
+        asyncio.run(send_telegram_message(message))
         
         bot_stats['total_analyses'] += 1
         bot_stats['last_analysis'] = datetime.now().isoformat()
 
     except Exception as e:
         print(f"❌ Analysis failed for {symbol}: {e}")
-        traceback.print_exc()
+        # traceback.print_exc() # Optional: print full error if needed
 
 # =========================================================================
 # === RUNNER ===
@@ -225,7 +214,6 @@ def generate_and_send_signal(symbol):
 def start_bot():
     print(f"🚀 Initializing {bot_stats['version']}...")
     scheduler = BackgroundScheduler()
-    # Runs every 30 mins to catch 1H candle closes
     for s in FOREX_PAIRS:
         scheduler.add_job(generate_and_send_signal, 'cron', minute='1,31', args=[s])
     scheduler.start()
