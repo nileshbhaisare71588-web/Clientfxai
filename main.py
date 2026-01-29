@@ -27,16 +27,16 @@ WATCHLIST = [
 TIMEFRAME = "1h"
 
 # =========================================================================
-# === FLASK APP (For Render) ===
+# === FLASK APP ===
 # =========================================================================
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Nilesh Bot V22 (Instant Trigger)"
+    return "Nilesh Bot V23 (Debug Mode Active)"
 
 # =========================================================================
-# === DATA ENGINE ===
+# === DATA ENGINE WITH ERROR REPORTING ===
 # =========================================================================
 
 def fetch_data(symbol):
@@ -45,7 +45,13 @@ def fetch_data(symbol):
     try:
         response = requests.get(url, params=params)
         data = response.json()
-        if "values" not in data: return pd.DataFrame()
+        
+        # DEBUG: Check if API returned an error
+        if "code" in data and data["code"] == 429:
+            return "RATE_LIMIT"
+        if "values" not in data:
+            return "NO_DATA"
+            
         df = pd.DataFrame(data["values"])
         df['datetime'] = pd.to_datetime(df['datetime'])
         df.set_index('datetime', inplace=True)
@@ -67,7 +73,8 @@ def fetch_data(symbol):
         low_close = np.abs(df['low'] - df['close'].shift())
         df['atr'] = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1).rolling(14).mean()
         return df.dropna()
-    except: return pd.DataFrame()
+    except Exception as e:
+        return f"ERROR: {str(e)}"
 
 def calculate_cpr(df):
     try:
@@ -104,18 +111,32 @@ def format_premium_card(symbol, signal, price, rsi, trend, tp1, tp2, sl):
         f"<b>Price:</b> <code>{price:{fmt}}</code>\n\n"
         f"📊 <b>MARKET CONTEXT</b>\n├ <b>Trend:</b> {trend_icon}\n├ <b>RSI ({rsi:.0f}):</b> {rsi_status}\n└ <b>Power:</b> {bar}\n\n"
         f"🎯 <b>KEY LEVELS</b>\n├ <b>TP 1:</b> <code>{tp1:{fmt}}</code>\n├ <b>TP 2:</b> <code>{tp2:{fmt}}</code>\n└ <b>SL:</b>   <code>{sl:{fmt}}</code>\n\n"
-        f"<i>Nilesh Quant V22</i>"
+        f"<i>Nilesh Quant V23</i>"
     )
 
 async def run_analysis_cycle(app_instance):
     print(f"🔄 Scanning 8 Pairs... {datetime.now()}")
     for symbol in WATCHLIST:
         try:
+            # Tell user we are checking...
+            # await app_instance.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"🔍 Checking {symbol}...")
+            
             df = fetch_data(symbol)
-            if df.empty:
-                print(f"⚠️ No data for {symbol}, skipping...")
-                time.sleep(2)
-                continue
+            
+            # --- DEBUGGING HANDLERS ---
+            if isinstance(df, str):
+                if df == "RATE_LIMIT":
+                    await app_instance.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"⚠️ <b>API LIMIT HIT</b> for {symbol}.\nWaiting 60s to cool down...", parse_mode='HTML')
+                    time.sleep(60)
+                    continue
+                elif df == "NO_DATA":
+                    await app_instance.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"⚠️ <b>NO DATA</b> returned for {symbol}. Check symbol name.", parse_mode='HTML')
+                    time.sleep(5)
+                    continue
+                else:
+                    await app_instance.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"⚠️ <b>ERROR</b> for {symbol}: {df}", parse_mode='HTML')
+                    time.sleep(5)
+                    continue
 
             cpr = calculate_cpr(df)
             last = df.iloc[-1]
@@ -148,28 +169,26 @@ async def run_analysis_cycle(app_instance):
 
             msg = format_premium_card(symbol, signal, price, rsi, trend, tp1, tp2, sl)
             if msg:
-                print(f"📤 Sending {symbol}...")
                 await app_instance.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode='HTML')
 
-            # Wait 8s to prevent API ban
-            time.sleep(8)
+            # CRITICAL: 15s wait to ensure we don't hit 8 requests/minute limit
+            time.sleep(15)
             
         except Exception as e:
-            print(f"❌ Error {symbol}: {e}")
+            await app_instance.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"❌ CRITICAL ERROR {symbol}: {e}")
 
 # =========================================================================
 # === BOT ENGINE ===
 # =========================================================================
 
 async def start_command(update, context):
-    await update.message.reply_text("👋 <b>Nilesh V22 Online</b>", parse_mode='HTML')
+    await update.message.reply_text("👋 <b>Nilesh V23 Online</b>", parse_mode='HTML')
 
 def start_bot_process():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     
     # 1. Clear Webhooks
-    print("🧹 Clearing Webhooks...")
     temp_bot = Bot(token=TELEGRAM_BOT_TOKEN)
     try: loop.run_until_complete(temp_bot.delete_webhook(drop_pending_updates=True))
     except: pass
@@ -182,16 +201,15 @@ def start_bot_process():
     try:
         loop.run_until_complete(application.bot.send_message(
             chat_id=TELEGRAM_CHAT_ID, 
-            text="🚀 <b>SYSTEM RESTORED</b>\nV22 Instant Trigger.\nSending 8 cards immediately...", 
+            text="🚀 <b>SYSTEM RESTORED (DEBUG MODE)</b>\nScanning will be slower (15s delay) to ensure stability.", 
             parse_mode='HTML'
         ))
     except: pass
 
-    # 4. INSTANT TRIGGER (Run loop immediately in background)
-    print("⚡ Triggering First Scan Now...")
+    # 4. INSTANT TRIGGER
     loop.create_task(run_analysis_cycle(application))
 
-    # 5. Schedule Future Scans (Every 30 mins)
+    # 5. Schedule Future Scans
     scheduler = BackgroundScheduler()
     scheduler.add_job(lambda: asyncio.run_coroutine_threadsafe(run_analysis_cycle(application), loop), 'interval', minutes=30)
     scheduler.start()
