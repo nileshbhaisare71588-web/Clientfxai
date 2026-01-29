@@ -74,27 +74,59 @@ def add_indicators(df):
     return df.dropna()
 
 # =========================================================================
-# === SIGNAL LOGIC ===
+# === PREMIUM DESIGN LOGIC (V14) ===
 # =========================================================================
 
 def format_signal_message(symbol, signal, price, rsi, trend, tp1, tp2, sl):
+    """
+    Generates a high-end, professional signal card.
+    """
+    is_buy = "BUY" in signal
+    
+    # 1. HEADER & COLORS
     if "STRONG BUY" in signal:
-        header, action, color = "💎 <b>PREMIUM BUY</b>", f"🚀 <b>LONG {symbol}</b>", "🟢🟢🟢🟢🟢"
+        header = "⚡ <b>INSTITUTIONAL BUY</b>"
+        side = "LONG 🟢"
+        emoji_bar = "🟩🟩🟩🟩🟩"
     elif "STRONG SELL" in signal:
-        header, action, color = "💎 <b>PREMIUM SELL</b>", f"🔻 <b>SHORT {symbol}</b>", "🔴🔴🔴🔴🔴"
-    else: return None
+        header = "⚡ <b>INSTITUTIONAL SELL</b>"
+        side = "SHORT 🔴"
+        emoji_bar = "🟥🟥🟥🟥🟥"
+    else: 
+        return None # Filter weak signals
 
-    fmt = ",.2f" if "JPY" in symbol or "XAU" in symbol else ",.4f"
-    return (
-        f"{header}\n{color}\n\n{action}\n"
-        f"💵 <b>Price:</b> <code>{price:{fmt}}</code>\n\n"
-        f"<b>📊 TECHNICALS</b>\n• Trend: <b>{trend}</b>\n• RSI: <code>{rsi:.1f}</code>\n\n"
-        f"<b>🎯 TARGETS</b>\n✅ <b>TP 1:</b> <code>{tp1:{fmt}}</code>\n🚀 <b>TP 2:</b> <code>{tp2:{fmt}}</code>\n"
-        f"🛡️ <b>SL:</b> <code>{sl:{fmt}}</code>\n\n{color}\n<i>Nilesh Quant V13</i>"
+    # 2. FORMATTING
+    # Gold & JPY pairs need 2 decimals, others need 4 or 5
+    fmt = ",.2f" if "JPY" in symbol or "XAU" in symbol or "BTC" in symbol else ",.5f"
+
+    # 3. ANALYSIS ICONS
+    trend_icon = "↗️ Bullish" if "Bullish" in trend else "↘️ Bearish"
+    rsi_status = "Overbought ⚠️" if rsi > 70 else "Oversold 💎" if rsi < 30 else "Neutral ⚖️"
+    
+    # 4. THE MESSAGE CARD
+    msg = (
+        f"{header}\n"
+        f"▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n"
+        f"<b>Asset:</b> #{symbol.replace('/', '')}   <b>Side:</b> {side}\n"
+        f"<b>Entry:</b> <code>{price:{fmt}}</code>\n\n"
+        
+        f"🎯 <b>PROFIT TARGETS</b>\n"
+        f"├ <b>TP 1:</b> <code>{tp1:{fmt}}</code> (Safe)\n"
+        f"└ <b>TP 2:</b> <code>{tp2:{fmt}}</code> (Rocket)\n\n"
+        
+        f"🛡 <b>STOP LOSS</b>\n"
+        f"└ <b>SL:</b>   <code>{sl:{fmt}}</code>\n\n"
+        
+        f"📊 <b>MARKET CONTEXT</b>\n"
+        f"├ <b>Trend:</b> {trend_icon}\n"
+        f"├ <b>RSI ({rsi:.0f}):</b> {rsi_status}\n"
+        f"└ <b>Strength:</b> {emoji_bar}\n\n"
+        
+        f"<i>Nilesh Quant V14 • {datetime.now().strftime('%H:%M UTC')}</i>"
     )
+    return msg
 
 async def run_analysis_cycle(app_instance, force_report=False):
-    """Scans markets. Sends report if force_report is True."""
     global market_status
     print(f"🔄 Scanning... {datetime.now()}")
     
@@ -109,7 +141,7 @@ async def run_analysis_cycle(app_instance, force_report=False):
             last = df.iloc[-1]
             price = last['close']
             
-            # Scoring
+            # Logic
             score = 0
             if price > last['ema_200']: score += 1
             else: score -= 1
@@ -133,11 +165,10 @@ async def run_analysis_cycle(app_instance, force_report=False):
 
             market_status[symbol] = f"{signal} (RSI: {rsi:.0f})"
 
-            # Send Strong Signal
             tp1 = cpr['R1'] if score > 0 else cpr['S1']
             tp2 = cpr['R2'] if score > 0 else cpr['S2']
             sl = price - (last['atr'] * 1.5) if score > 0 else price + (last['atr'] * 1.5)
-            trend = "Bullish 📈" if price > last['ema_200'] else "Bearish 📉"
+            trend = "Bullish" if price > last['ema_200'] else "Bearish"
 
             msg = format_signal_message(symbol, signal, price, rsi, trend, tp1, tp2, sl)
             if msg:
@@ -147,29 +178,28 @@ async def run_analysis_cycle(app_instance, force_report=False):
         except Exception as e:
             print(f"Error {symbol}: {e}")
             
-    # Auto-send report if requested (e.g., at startup)
     if force_report:
         await send_full_report(app_instance)
 
 async def send_full_report(app_instance):
-    """Generates the full status report."""
     if not market_status: return
-    msg = "📊 <b>LIVE MARKET REPORT</b>\n\n"
+    msg = "📊 <b>LIVE MARKET SCAN</b>\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n"
     for sym, status in market_status.items():
         icon = "🟢" if "BUY" in status else "🔴" if "SELL" in status else "⚪"
         msg += f"{icon} <b>{sym}:</b> {status}\n"
+    msg += f"\n<i>Updated: {datetime.now().strftime('%H:%M UTC')}</i>"
     await app_instance.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode='HTML')
 
 # =========================================================================
-# === THREADED BOT RUNNER ===
+# === BOT SETUP ===
 # =========================================================================
 
 async def start_command(update, context):
-    await update.message.reply_text("👋 <b>Nilesh Bot V13 Online!</b>", parse_mode='HTML')
+    await update.message.reply_text("👋 <b>Nilesh V14 Online</b>", parse_mode='HTML')
 
 async def report_command(update, context):
     if not market_status:
-        await update.message.reply_text("⏳ Collecting data... Wait 2 mins.")
+        await update.message.reply_text("⏳ Analyzing markets... Wait 2 mins.")
         return
     await send_full_report(context.application)
 
@@ -181,18 +211,15 @@ def start_bot_process():
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("report", report_command))
 
-    # Send Startup Message
     loop.run_until_complete(application.bot.send_message(
         chat_id=TELEGRAM_CHAT_ID, 
-        text="🚀 <b>SYSTEM ONLINE</b>\nScanning started. Report coming in 60s...", 
+        text="🚀 <b>SYSTEM ONLINE</b>\nBot upgraded to V14 Premium Design.\nScanning markets now...", 
         parse_mode='HTML'
     ))
 
-    # Scheduler
     scheduler = BackgroundScheduler()
-    # 1. Regular Scan every 30 mins
     scheduler.add_job(lambda: asyncio.run_coroutine_threadsafe(run_analysis_cycle(application, force_report=False), loop), 'interval', minutes=30)
-    # 2. IMMEDIATE First Scan (starts in 5 seconds)
+    # First scan starts immediately
     scheduler.add_job(lambda: asyncio.run_coroutine_threadsafe(run_analysis_cycle(application, force_report=True), loop), 'date', run_date=datetime.now())
     scheduler.start()
 
@@ -200,14 +227,14 @@ def start_bot_process():
     application.run_polling(stop_signals=None)
 
 # =========================================================================
-# === FLASK ENTRY POINT ===
+# === FLASK ENTRY ===
 # =========================================================================
 
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return f"Nilesh Bot V13 Running | Pairs: {len(market_status)}"
+    return f"Nilesh Bot V14 Running | Pairs: {len(market_status)}"
 
 if os.environ.get("WERKZEUG_RUN_MAIN") != "true":
     t = threading.Thread(target=start_bot_process, daemon=True)
