@@ -19,15 +19,15 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# --- STRICT ASSET LIST (ONLY THE 3 YOU REQUESTED) ---
+# --- STRICT ASSET MAP (Yahoo Tickers) ---
+# We use 'GC=F' for Gold because it has better volume data than 'XAUUSD=X'
 ASSET_MAP = {
     "GBP/JPY": "GBPJPY=X",
-    "XAU/USD": "GC=F",      # Gold Futures
-    "AUD/CAD": "AUDCAD=X"
+    "AUD/CAD": "AUDCAD=X",
+    "XAU/USD": "GC=F"
 }
 
-# The bot will ONLY look at this list
-WATCHLIST = ["GBP/JPY", "XAU/USD", "AUD/CAD"]
+WATCHLIST = list(ASSET_MAP.keys())
 TIMEFRAME_MAIN = "4h"
 
 # Initialize Bot
@@ -38,15 +38,16 @@ bot_stats = {
     "total_analyses": 0,
     "last_analysis": None,
     "monitored_assets": WATCHLIST,
-    "version": "V5.0 Strict Mode"
+    "version": "V6.0 Stealth Mode"
 }
 
 # =========================================================================
-# === ADVANCED INDICATOR ENGINE ===
+# === INDICATOR ENGINE ===
 # =========================================================================
 
 def calculate_cpr(df):
     try:
+        # Aggregate hourly data into Daily candles for CPR
         df_daily = df.resample('D').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'}).dropna()
         if len(df_daily) < 2: return None
         prev_day = df_daily.iloc[-2]
@@ -90,27 +91,30 @@ def add_indicators(df):
     df['atr'] = np.max(ranges, axis=1).rolling(14).mean()
     return df.dropna()
 
-def fetch_data_with_retry(symbol_name):
-    """Fetches data with intelligent retry logic."""
+def fetch_data_stealth(symbol_name):
+    """Fetches data with heavy stealth delays to avoid Rate Limits."""
     ticker = ASSET_MAP.get(symbol_name)
     max_retries = 3
     
     for attempt in range(max_retries):
         try:
-            # Random jitter to prevent ban
+            # random sleep 2-5s before every single request
             time.sleep(random.uniform(2, 5))
             
             df = yf.download(tickers=ticker, period="1mo", interval="1h", progress=False, multi_level_index=False)
             
-            if df.empty: return pd.DataFrame()
+            if df.empty: 
+                print(f"⚠️ Empty data for {symbol_name}")
+                return pd.DataFrame()
 
             df.columns = df.columns.str.lower()
             df = add_indicators(df)
             return df
 
         except Exception as e:
-            print(f"⚠️ Fetch failed for {symbol_name}: {e}")
-            time.sleep(random.uniform(10, 15))
+            print(f"⚠️ Fetch error {symbol_name}: {e}")
+            # If error, wait 30 seconds before retry
+            time.sleep(30)
             
     return pd.DataFrame()
 
@@ -122,13 +126,14 @@ def resample_to_4h(df_1h):
     except: return pd.DataFrame()
 
 # =========================================================================
-# === SIGNAL ANALYSIS ===
+# === ANALYZER ===
 # =========================================================================
 
 def analyze_market(symbol):
     global bot_stats
     try:
-        df_1h = fetch_data_with_retry(symbol)
+        print(f"🔍 Analyzing {symbol}...")
+        df_1h = fetch_data_stealth(symbol)
         if df_1h.empty: return
 
         df_4h = resample_to_4h(df_1h)
@@ -140,20 +145,24 @@ def analyze_market(symbol):
         last_4h = df_4h.iloc[-1]
         price = last_1h['close']
 
-        # Scoring
+        # --- SCORING ---
         score = 0
+        # Trend
         if price > last_4h['ema_200']: score += 1
         else: score -= 1
         
+        # MACD
         if last_4h['macd'] > last_4h['signal_line']: score += 1
         else: score -= 1
 
+        # RSI
         rsi = last_4h['rsi']
         if 50 < rsi < 70: score += 0.5
         elif 30 < rsi < 50: score -= 0.5
         elif rsi > 70: score -= 0.5
         elif rsi < 30: score += 0.5
 
+        # CPR
         if price > cpr['PP']: score += 0.5
         else: score -= 0.5
 
@@ -161,7 +170,7 @@ def analyze_market(symbol):
         if price > last_4h['bb_upper']: vol_status = "⚠️ High (Overbought)"
         elif price < last_4h['bb_lower']: vol_status = "⚠️ High (Oversold)"
 
-        # Decision
+        # --- SIGNAL DECISION ---
         signal = "WAIT"
         emoji = "⚖️"
         if score >= 2.5: signal, emoji = "STRONG BUY", "🚀"
@@ -180,7 +189,7 @@ def analyze_market(symbol):
 
         message = (
             f"╔════════════════════════════════╗\n"
-            f"  🔥 <b>NILESH FX & GOLD SIGNALS</b>\n"
+            f"  🔥 <b>NILESH FX & GOLD AI</b>\n"
             f"╚════════════════════════════════╝\n\n"
             f"<b>Asset:</b> {symbol}\n"
             f"<b>Price:</b> <code>{price:{fmt}}</code>\n"
@@ -200,7 +209,7 @@ def analyze_market(symbol):
         )
 
         asyncio.run(bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode='HTML'))
-        print(f"✅ Sent {symbol}")
+        print(f"✅ Signal sent for {symbol}")
         bot_stats['total_analyses'] += 1
         bot_stats['last_analysis'] = datetime.now().isoformat()
 
@@ -209,27 +218,28 @@ def analyze_market(symbol):
         traceback.print_exc()
 
 # =========================================================================
-# === STARTUP ===
+# === STEALTH SCHEDULER ===
 # =========================================================================
 
 def initial_startup_check():
-    """Checks only your 3 assets sequentially."""
-    print("⏳ Starting initial checks...")
+    """Sequential check with LONG delays to prevent Ban."""
+    print("⏳ Starting initial checks (Stealth Mode)...")
     for symbol in WATCHLIST:
         analyze_market(symbol)
-        time.sleep(10) # 10s wait between your 3 pairs
+        # CRITICAL: 20 second wait between pairs
+        print("zzz Sleeping 20s...") 
+        time.sleep(20) 
     print("✅ Initial checks complete.")
 
 def start_bot():
     print(f"🚀 Initializing {bot_stats['version']}...")
     scheduler = BackgroundScheduler()
     
-    # Schedule updates for only your 3 pairs
-    # Spaced out: Min 0, Min 10, Min 20
-    for i, pair in enumerate(WATCHLIST):
-        scheduled_minute = i * 10
-        scheduler.add_job(analyze_market, 'cron', minute=f"{scheduled_minute}", args=[pair])
-        print(f"📅 Scheduled {pair} for minute :{scheduled_minute}")
+    # Schedule updates apart from each other
+    # GBP/JPY at :00, AUD/CAD at :15, XAU/USD at :30
+    scheduler.add_job(analyze_market, 'cron', minute='0,30', args=["GBP/JPY"])
+    scheduler.add_job(analyze_market, 'cron', minute='15,45', args=["AUD/CAD"])
+    scheduler.add_job(analyze_market, 'cron', minute='10,40', args=["XAU/USD"])
     
     scheduler.start()
     
