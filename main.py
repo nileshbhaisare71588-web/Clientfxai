@@ -19,7 +19,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # UPDATED: Added GBP/JPY and AUD/CAD specifically for you
-DEFAULT_PAIRS = "EUR/USD,GBP/USD,USD/JPY,XAU/USD,BTC/USD,GBP/JPY,AUD/CAD"
+DEFAULT_PAIRS = "EUR/USD,GBP/JPY,AUD/USD,GBP/USD,XAU/USD,AUD/CAD,AUD/JPY,BTC/USD"
 FOREX_PAIRS = [p.strip() for p in os.getenv("FOREX_PAIRS", DEFAULT_PAIRS).split(',')]
 APP_URL = os.getenv("RENDER_EXTERNAL_URL") 
 
@@ -277,3 +277,4 @@ def health(): return jsonify({"status": "healthy"}), 200
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
+
