@@ -1,16 +1,15 @@
 import os
-import ccxt
 import pandas as pd
 import numpy as np
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime
 from apscheduler.schedulers.background import BackgroundScheduler
 from telegram import Bot
 from flask import Flask, jsonify, render_template_string
 import threading
 import time
 import traceback
-import yfinance as yf  # NEW: Backup for Forex pairs Kraken doesn't have
+import yfinance as yf
 
 # --- CONFIGURATION ---
 from dotenv import load_dotenv
@@ -19,45 +18,67 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# UPDATED: FIXED LIST FOR SPECIFIC PAIRS ONLY
-# Kraken doesn't have AUD/CAD or GBP/JPY, so the bot will now use the Yahoo fallback for them.
-CRYPTOS = ["GBP/JPY", "XAU/USD", "AUD/CAD"]
+# --- ASSET MAPPING (User Friendly Name -> Yahoo Ticker) ---
+# This ensures we get the EXACT data for the pairs you requested.
+ASSET_MAP = {
+    "EUR/USD": "EURUSD=X",
+    "GBP/JPY": "GBPJPY=X",
+    "AUD/USD": "AUDUSD=X",
+    "GBP/USD": "GBPUSD=X",
+    "XAU/USD": "GC=F",      # Gold Futures (Better data/volume than Spot)
+    "AUD/CAD": "AUDCAD=X",
+    "AUD/JPY": "AUDJPY=X",
+    "BTC/USD": "BTC-USD"
+}
+
+# List of keys to iterate over
+WATCHLIST = list(ASSET_MAP.keys())
 
 TIMEFRAME_MAIN = "4h"  # Major Trend
 TIMEFRAME_ENTRY = "1h" # Entry Precision
 
-# Initialize Bot and Exchange
+# Initialize Bot
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
-exchange = ccxt.kraken({'enableRateLimit': True})
 
 bot_stats = {
     "status": "initializing",
     "total_analyses": 0,
     "last_analysis": None,
-    "monitored_assets": CRYPTOS,
-    "uptime_start": datetime.now().isoformat(),
-    "version": "V3.1 Forex Fix"
+    "monitored_assets": WATCHLIST,
+    "version": "V4.0 Unified Engine"
 }
 
 # =========================================================================
-# === DATA ENGINE (KRAKEN + YAHOO FALLBACK) ===
+# === ADVANCED INDICATOR ENGINE ===
 # =========================================================================
 
-def calculate_cpr_levels(df_daily):
-    """Calculates Daily Pivot Points."""
-    if df_daily.empty or len(df_daily) < 2: return None
-    prev_day = df_daily.iloc[-2]
-    H, L, C = prev_day['high'], prev_day['low'], prev_day['close']
-    PP = (H + L + C) / 3.0
-    BC = (H + L) / 2.0
-    TC = PP - BC + PP
-    return {
-        'PP': PP, 'TC': TC, 'BC': BC,
-        'R1': 2*PP - L, 'S1': 2*PP - H,
-        'R2': PP + (H - L), 'S2': PP - (H - L)
-    }
+def calculate_cpr(df):
+    """Calculates Pivot Points based on previous day's data."""
+    try:
+        # Resample to Daily to find yesterday's High/Low/Close
+        # Yahoo gives us hourly data, so we aggregate it to finding 'Daily' candles
+        df_daily = df.resample('D').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'}).dropna()
+        
+        if len(df_daily) < 2: return None
+        
+        # Get yesterday's candle (iloc[-2] because -1 is 'today' which is incomplete)
+        prev_day = df_daily.iloc[-2]
+        
+        H, L, C = prev_day['high'], prev_day['low'], prev_day['close']
+        PP = (H + L + C) / 3.0
+        BC = (H + L) / 2.0
+        TC = PP - BC + PP
+        
+        return {
+            'PP': PP, 'TC': TC, 'BC': BC,
+            'R1': 2*PP - L, 'S1': 2*PP - H,
+            'R2': PP + (H - L), 'S2': PP - (H - L)
+        }
+    except Exception as e:
+        print(f"Error calculating CPR: {e}")
+        return None
 
-def add_technical_indicators(df):
+def add_indicators(df):
     """Adds RSI, MACD, BB, EMA, ATR."""
     if df.empty: return df
     
@@ -84,196 +105,196 @@ def add_technical_indicators(df):
     df['bb_upper'] = df['bb_middle'] + (2 * df['bb_std'])
     df['bb_lower'] = df['bb_middle'] - (2 * df['bb_std'])
 
-    # 5. ATR
+    # 5. ATR (Average True Range)
     high_low = df['high'] - df['low']
     high_close = np.abs(df['high'] - df['close'].shift())
     low_close = np.abs(df['low'] - df['close'].shift())
     ranges = pd.concat([high_low, high_close, low_close], axis=1)
     df['atr'] = np.max(ranges, axis=1).rolling(14).mean()
 
-    return df
+    return df.dropna()
 
-def fetch_yfinance_data(symbol, timeframe):
-    """Fallback to Yahoo Finance for pairs Kraken doesn't have."""
+def fetch_data(symbol_name):
+    """Fetches data from Yahoo Finance using the mapped ticker."""
+    ticker = ASSET_MAP.get(symbol_name)
+    if not ticker: return pd.DataFrame()
+
     try:
-        # Map Common Names to Yahoo Tickers
-        # GBP/JPY -> GBPJPY=X
-        yf_symbol = symbol.replace("/", "") + "=X"
-        if "XAU" in symbol: yf_symbol = "GC=F" # Gold Futures
-
-        # Fetch data
-        period = "1mo"
-        interval = "1h"
+        # Fetch 1 month of 1h data (covers both 1h and 4h analysis)
+        # Using 1h interval is reliable on Yahoo
+        df = yf.download(tickers=ticker, period="1mo", interval="1h", progress=False, multi_level_index=False)
         
-        # We always fetch 1h first, then resample if needed
-        df = yf.download(tickers=yf_symbol, period=period, interval=interval, progress=False)
+        if df.empty:
+            print(f"⚠️ No data for {symbol_name} ({ticker})")
+            return pd.DataFrame()
+
+        # Clean Columns (Yahoo sometimes returns MultiIndex, sometimes not)
+        # We force lowercase for consistency
+        df.columns = df.columns.str.lower()
         
-        if df.empty: return pd.DataFrame()
+        # Ensure required columns exist
+        required = ['open', 'high', 'low', 'close']
+        if not all(col in df.columns for col in required):
+            print(f"⚠️ Missing columns for {symbol_name}")
+            return pd.DataFrame()
 
-        # Flatten MultiIndex columns if present (Fix for recent yfinance update)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
+        # Add Indicators
+        df = add_indicators(df)
+        
+        return df
 
-        df = df.rename(columns={'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'})
-        df.index.name = 'timestamp'
-
-        # Resample for 4H or Daily
-        if timeframe == "4h":
-            df = df.resample('4h').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'})
-        elif timeframe == "1d":
-            df = df.resample('1d').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'})
-
-        return df.dropna()
     except Exception as e:
-        print(f"⚠️ Yahoo Fetch Error for {symbol}: {e}")
+        print(f"❌ Error fetching {symbol_name}: {e}")
         return pd.DataFrame()
 
-def fetch_data_safe(symbol, timeframe):
-    """Tries Kraken first, then switches to Yahoo Finance if needed."""
-    # 1. Try Kraken
+def resample_to_4h(df_1h):
+    """Aggregates 1H data into 4H candles."""
     try:
-        if not exchange.markets: exchange.load_markets()
-        # Search for symbol in Kraken markets
-        found_id = None
-        for key in exchange.markets.keys():
-            if symbol in key:
-                found_id = exchange.markets[key]['id']
-                break
-        
-        if found_id:
-            ohlcv = exchange.fetch_ohlcv(found_id, timeframe, limit=300)
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            df.set_index('timestamp', inplace=True)
-            df = add_technical_indicators(df)
-            return df.dropna()
+        agg_dict = {
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last',
+            'volume': 'sum' if 'volume' in df_1h.columns else 'first'
+        }
+        df_4h = df_1h.resample('4H').agg(agg_dict).dropna()
+        # Re-calculate indicators on the 4H timeframe
+        df_4h = add_indicators(df_4h)
+        return df_4h
     except:
-        pass # Kraken failed, proceed to fallback
-
-    # 2. Fallback to Yahoo Finance (For AUD/CAD, GBP/JPY etc)
-    print(f"🔄 Switching to Backup Data (Yahoo) for {symbol}...")
-    df = fetch_yfinance_data(symbol, timeframe)
-    df = add_technical_indicators(df)
-    return df
+        return pd.DataFrame()
 
 # =========================================================================
-# === SIGNAL LOGIC ===
+# === SIGNAL ANALYSIS ===
 # =========================================================================
 
-def determine_signal_strength(row_4h, row_1h, cpr_data):
-    score = 0
-    price = row_4h['close']
-    
-    # Trend (4H)
-    if price > row_4h['ema_200']: score += 1
-    else: score -= 1
-    
-    if row_4h['ema_50'] > row_4h['ema_200']: score += 1
-    else: score -= 1
-
-    # Momentum
-    rsi = row_4h['rsi']
-    if 50 < rsi < 70: score += 0.5 
-    elif rsi < 30: score += 0.5
-    elif rsi > 70: score -= 0.5
-    elif 30 < rsi < 50: score -= 0.5
-
-    if row_4h['macd'] > row_4h['signal_line']: score += 1
-    else: score -= 1
-
-    # Price Action
-    if price > cpr_data['PP']: score += 0.5
-    else: score -= 0.5
-
-    # Volatility Status
-    vol_status = "Normal"
-    if price > row_4h['bb_upper']: vol_status = "High (Overbought)"
-    elif price < row_4h['bb_lower']: vol_status = "High (Oversold)"
-    
-    if score >= 3: return "STRONG BUY", "🚀", score, vol_status
-    elif 1 <= score < 3: return "BUY", "🟢", score, vol_status
-    elif -3 < score <= -1: return "SELL", "🔴", score, vol_status
-    elif score <= -3: return "STRONG SELL", "🔻", score, vol_status
-    else: return "NEUTRAL", "⚖️", score, vol_status
-
-def generate_and_send_signal(symbol):
+def analyze_market(symbol):
     global bot_stats
     try:
-        # Fetch Data
-        df_4h = fetch_data_safe(symbol, TIMEFRAME_MAIN)
-        df_1h = fetch_data_safe(symbol, TIMEFRAME_ENTRY)
-        
-        # Fetch Daily for CPR
-        # For CPR we try to get daily data from the same source
-        df_d = fetch_data_safe(symbol, "1d") 
-        cpr = calculate_cpr_levels(df_d)
+        # 1. Get Data (Base 1H)
+        df_1h = fetch_data(symbol)
+        if df_1h.empty: return
 
-        if df_4h.empty or df_1h.empty or cpr is None: 
-            print(f"⚠️ No data found for {symbol}")
-            return
+        # 2. Derive 4H Data
+        df_4h = resample_to_4h(df_1h)
+        if df_4h.empty: return
 
-        last_4h = df_4h.iloc[-1]
+        # 3. Calculate CPR (using the daily aggregation of 1H data)
+        cpr = calculate_cpr(df_1h)
+        if not cpr: return
+
+        # 4. Get Latest Candles
         last_1h = df_1h.iloc[-1]
-        price = last_4h['close']
+        last_4h = df_4h.iloc[-1]
+        price = last_1h['close']
+
+        # --- SCORING LOGIC ---
+        score = 0
         
-        signal, emoji, score, vol_status = determine_signal_strength(last_4h, last_1h, cpr)
+        # Trend (4H) - Weight 1.0
+        if price > last_4h['ema_200']: score += 1
+        else: score -= 1
         
+        # Momentum (MACD) - Weight 1.0
+        if last_4h['macd'] > last_4h['signal_line']: score += 1
+        else: score -= 1
+
+        # RSI Filter - Weight 0.5
+        rsi = last_4h['rsi']
+        if 50 < rsi < 70: score += 0.5   # Healthy Bull
+        elif 30 < rsi < 50: score -= 0.5 # Healthy Bear
+        elif rsi > 70: score -= 0.5      # Overbought (Risk)
+        elif rsi < 30: score += 0.5      # Oversold (Bounce opportunity)
+
+        # Pivot Context - Weight 0.5
+        if price > cpr['PP']: score += 0.5
+        else: score -= 0.5
+
+        # Volatility Check
+        vol_status = "Normal"
+        if price > last_4h['bb_upper']: vol_status = "⚠️ High (Overbought)"
+        elif price < last_4h['bb_lower']: vol_status = "⚠️ High (Oversold)"
+
+        # --- DECISION ---
+        signal = "WAIT"
+        emoji = "⚖️"
+        
+        if score >= 2.5:
+            signal = "STRONG BUY"
+            emoji = "🚀"
+        elif 1.0 <= score < 2.5:
+            signal = "BUY"
+            emoji = "🟢"
+        elif -2.5 < score <= -1.0:
+            signal = "SELL"
+            emoji = "🔴"
+        elif score <= -2.5:
+            signal = "STRONG SELL"
+            emoji = "🔻"
+
+        # --- MESSAGE FORMATTING ---
         # Targets
         is_buy = score > 0
         tp1 = cpr['R1'] if is_buy else cpr['S1']
         tp2 = cpr['R2'] if is_buy else cpr['S2']
-        atr_sl = last_4h['atr'] * 1.5
-        sl = price - atr_sl if is_buy else price + atr_sl
         
-        fmt = ",.2f"
+        # Stop Loss (ATR Based)
+        atr_buffer = last_4h['atr'] * 1.5
+        sl = price - atr_buffer if is_buy else price + atr_buffer
+        
+        # Decimals: Gold/JPY need 2 decimals, others need 4 or 5
+        fmt = ",.2f" if "JPY" in symbol or "XAU" in symbol else ",.4f"
 
         message = (
             f"╔════════════════════════════════╗\n"
-            f"  🏆 <b>NILESH FOREX & GOLD AI</b>\n"
+            f"  🔥 <b>NILESH FX & GOLD SIGNALS</b>\n"
             f"╚════════════════════════════════╝\n\n"
             f"<b>Asset:</b> {symbol}\n"
             f"<b>Price:</b> <code>{price:{fmt}}</code>\n"
             f"<b>Volatility:</b> {vol_status}\n\n"
             f"--- 🚨 {emoji} <b>{signal}</b> 🚨 ---\n\n"
-            f"<b>📊 METRICS:</b>\n"
-            f"• <b>Trend (200 EMA):</b> {'BULLISH' if price > last_4h['ema_200'] else 'BEARISH'}\n"
-            f"• <b>RSI (4h):</b> <code>{last_4h['rsi']:.1f}</code>\n"
-            f"• <b>MACD:</b> {'Bullish' if last_4h['macd'] > last_4h['signal_line'] else 'Bearish'}\n"
+            f"<b>📊 ANALYSIS:</b>\n"
+            f"• <b>Trend (EMA200):</b> {'UP 📈' if price > last_4h['ema_200'] else 'DOWN 📉'}\n"
+            f"• <b>RSI (4h):</b> <code>{rsi:.1f}</code>\n"
+            f"• <b>Momentum:</b> {'Bullish' if last_4h['macd'] > last_4h['signal_line'] else 'Bearish'}\n"
             f"• <b>Pivot:</b> {'Above' if price > cpr['PP'] else 'Below'} PP\n\n"
             f"<b>🎯 LEVELS:</b>\n"
             f"✅ <b>TP 1:</b> <code>{tp1:{fmt}}</code>\n"
             f"🔥 <b>TP 2:</b> <code>{tp2:{fmt}}</code>\n"
-            f"🛑 <b>SL:</b> <code>{sl:{fmt}}</code>\n\n"
+            f"🛑 <b>Stop Loss:</b> <code>{sl:{fmt}}</code>\n\n"
             f"----------------------------------------\n"
             f"<i>Powered by Nilesh System</i>"
         )
 
+        # Send to Telegram
         asyncio.run(bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode='HTML'))
+        
+        print(f"✅ Analyzed {symbol} -> {signal}")
         bot_stats['total_analyses'] += 1
         bot_stats['last_analysis'] = datetime.now().isoformat()
-        print(f"✅ Signal sent for {symbol}")
 
     except Exception as e:
-        print(f"❌ Error {symbol}: {e}")
+        print(f"❌ Failed {symbol}: {e}")
         traceback.print_exc()
 
 # =========================================================================
-# === STARTUP ===
+# === RUNNER ===
 # =========================================================================
 
 def start_bot():
-    print(f"🚀 Initializing {bot_stats['version']}...")
+    print(f"🚀 Starting Nilesh System {bot_stats['version']}...")
     scheduler = BackgroundScheduler()
     
-    for idx, s in enumerate(CRYPTOS):
-        # Run every 30 mins
-        scheduler.add_job(generate_and_send_signal, 'cron', minute='0,30', second=idx*5, args=[s])
+    # Schedule every 30 minutes
+    # Stagger execution to prevent network congestion
+    for i, pair in enumerate(WATCHLIST):
+        scheduler.add_job(analyze_market, 'cron', minute='0,30', second=i*5, args=[pair])
     
     scheduler.start()
     
-    # Immediate check
-    for s in CRYPTOS:
-        threading.Thread(target=generate_and_send_signal, args=(s,)).start()
+    # Run Immediate Analysis
+    for pair in WATCHLIST:
+        threading.Thread(target=analyze_market, args=(pair,)).start()
 
 start_bot()
 
@@ -281,7 +302,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return render_template_string("<h1>Nilesh Bot Running</h1><p>Active</p>")
+    return render_template_string("<h1>Nilesh Bot Active</h1><p>Status: OK</p>")
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
