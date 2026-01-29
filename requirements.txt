@@ -6,3 +6,4 @@ pandas
 numpy
 apscheduler
 python-dotenv
+yfinance
