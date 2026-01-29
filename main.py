@@ -1,267 +1,279 @@
-# main.py - PREMIER FOREX AI QUANT V2.11 (Fixed Pair List)
-
 import os
 import ccxt
 import pandas as pd
 import numpy as np
-import requests
+import asyncio
+from datetime import datetime, timedelta
+from apscheduler.schedulers.background import BackgroundScheduler
+from telegram import Bot
+from flask import Flask, jsonify, render_template_string
 import threading
 import time
-from datetime import datetime
-from apscheduler.schedulers.background import BackgroundScheduler
-from flask import Flask, jsonify, render_template_string
+import traceback
+import yfinance as yf  # NEW: Backup for Forex pairs Kraken doesn't have
 
 # --- CONFIGURATION ---
-from dotenv import load_dotenv 
-load_dotenv() 
+from dotenv import load_dotenv
+load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# UPDATED: Added GBP/JPY and AUD/CAD specifically for you
-DEFAULT_PAIRS = "EUR/USD,GBP/JPY,AUD/USD,GBP/USD,XAU/USD,AUD/CAD,AUD/JPY,BTC/USD"
-FOREX_PAIRS = [p.strip() for p in os.getenv("FOREX_PAIRS", DEFAULT_PAIRS).split(',')]
-APP_URL = os.getenv("RENDER_EXTERNAL_URL") 
+# UPDATED: FIXED LIST FOR SPECIFIC PAIRS ONLY
+# Kraken doesn't have AUD/CAD or GBP/JPY, so the bot will now use the Yahoo fallback for them.
+CRYPTOS = ["GBP/JPY", "XAU/USD", "AUD/CAD"]
 
-TIMEFRAME_HTF = "4h"
-TIMEFRAME_LTF = "1h"
+TIMEFRAME_MAIN = "4h"  # Major Trend
+TIMEFRAME_ENTRY = "1h" # Entry Precision
 
-# Initialize Kraken
-exchange = ccxt.kraken({
-    'enableRateLimit': True, 
-    'rateLimit': 2000,
-    'params': {'timeout': 20000}
-})
+# Initialize Bot and Exchange
+bot = Bot(token=TELEGRAM_BOT_TOKEN)
+exchange = ccxt.kraken({'enableRateLimit': True})
 
 bot_stats = {
     "status": "initializing",
     "total_analyses": 0,
     "last_analysis": None,
-    "version": "V2.11 Custom Pairs"
+    "monitored_assets": CRYPTOS,
+    "uptime_start": datetime.now().isoformat(),
+    "version": "V3.1 Forex Fix"
 }
 
 # =========================================================================
-# === TELEGRAM ENGINE (HTTP Direct) ===
+# === DATA ENGINE (KRAKEN + YAHOO FALLBACK) ===
 # =========================================================================
 
-def send_telegram_message(message):
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
-            "parse_mode": "HTML"
-        }
-        requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        print(f"⚠️ Telegram Send Error: {e}")
+def calculate_cpr_levels(df_daily):
+    """Calculates Daily Pivot Points."""
+    if df_daily.empty or len(df_daily) < 2: return None
+    prev_day = df_daily.iloc[-2]
+    H, L, C = prev_day['high'], prev_day['low'], prev_day['close']
+    PP = (H + L + C) / 3.0
+    BC = (H + L) / 2.0
+    TC = PP - BC + PP
+    return {
+        'PP': PP, 'TC': TC, 'BC': BC,
+        'R1': 2*PP - L, 'S1': 2*PP - H,
+        'R2': PP + (H - L), 'S2': PP - (H - L)
+    }
 
-def send_startup_message():
-    # Lists the actual pairs being monitored so you can verify
-    pairs_formatted = "\n".join([f"• {p}" for p in FOREX_PAIRS])
-    msg = (
-        f"🟢 <b>SYSTEM ONLINE: V2.11</b>\n"
-        f"───────────────────\n"
-        f"<b>Monitoring {len(FOREX_PAIRS)} Assets:</b>\n"
-        f"{pairs_formatted}\n"
-        f"───────────────────\n"
-        f"<i>Sending initial status report now...</i>"
-    )
-    send_telegram_message(msg)
+def add_technical_indicators(df):
+    """Adds RSI, MACD, BB, EMA, ATR."""
+    if df.empty: return df
+    
+    # 1. EMAs
+    df['ema_50'] = df['close'].ewm(span=50, adjust=False).mean()
+    df['ema_200'] = df['close'].ewm(span=200, adjust=False).mean()
 
-def send_heartbeat():
-    if bot_stats['last_analysis']:
-        last_time = datetime.fromisoformat(bot_stats['last_analysis']).strftime("%H:%M")
-    else:
-        last_time = "Just Started"
-    msg = (
-        f"💓 <b>SYSTEM HEARTBEAT</b>\n"
-        f"Status: 🟢 Running\n"
-        f"Last Scan: {last_time} UTC\n"
-    )
-    send_telegram_message(msg)
+    # 2. RSI (14)
+    delta = df['close'].diff()
+    up = delta.clip(lower=0)
+    down = -1 * delta.clip(upper=0)
+    rs = up.ewm(com=13, adjust=False).mean() / down.ewm(com=13, adjust=False).mean()
+    df['rsi'] = 100 - (100 / (1 + rs))
 
-# =========================================================================
-# === ANALYTICAL ENGINES ===
-# =========================================================================
+    # 3. MACD
+    exp1 = df['close'].ewm(span=12, adjust=False).mean()
+    exp2 = df['close'].ewm(span=26, adjust=False).mean()
+    df['macd'] = exp1 - exp2
+    df['signal_line'] = df['macd'].ewm(span=9, adjust=False).mean()
 
-def calculate_atr(df, period=14):
+    # 4. Bollinger Bands
+    df['bb_middle'] = df['close'].rolling(window=20).mean()
+    df['bb_std'] = df['close'].rolling(window=20).std()
+    df['bb_upper'] = df['bb_middle'] + (2 * df['bb_std'])
+    df['bb_lower'] = df['bb_middle'] - (2 * df['bb_std'])
+
+    # 5. ATR
     high_low = df['high'] - df['low']
     high_close = np.abs(df['high'] - df['close'].shift())
     low_close = np.abs(df['low'] - df['close'].shift())
     ranges = pd.concat([high_low, high_close, low_close], axis=1)
-    true_range = np.max(ranges, axis=1)
-    return true_range.rolling(period).mean()
+    df['atr'] = np.max(ranges, axis=1).rolling(14).mean()
 
-def detect_structure(df):
-    df['is_high'] = df['high'][(df['high'].shift(1) < df['high']) & (df['high'].shift(-1) < df['high'])]
-    df['is_low'] = df['low'][(df['low'].shift(1) > df['low']) & (df['low'].shift(-1) > df['low'])]
-    last_highs = df['is_high'].dropna().tail(2)
-    last_lows = df['is_low'].dropna().tail(2)
-    
-    if len(last_highs) < 2 or len(last_lows) < 2: return "NEUTRAL"
-    
-    if last_highs.iloc[-1] > last_highs.iloc[-2] and last_lows.iloc[-1] > last_lows.iloc[-2]: return "BULLISH"
-    elif last_highs.iloc[-1] < last_highs.iloc[-2] and last_lows.iloc[-1] < last_lows.iloc[-2]: return "BEARISH"
-    return "NEUTRAL"
+    return df
 
-def detect_fvg(df):
-    recent_data = df.iloc[-6:-1] 
-    fvg_zone = None
-    fvg_type = None
-    for i in range(len(recent_data) - 2):
-        curr_high = float(recent_data.iloc[i]['high'])
-        next_low = float(recent_data.iloc[i+2]['low'])
+def fetch_yfinance_data(symbol, timeframe):
+    """Fallback to Yahoo Finance for pairs Kraken doesn't have."""
+    try:
+        # Map Common Names to Yahoo Tickers
+        # GBP/JPY -> GBPJPY=X
+        yf_symbol = symbol.replace("/", "") + "=X"
+        if "XAU" in symbol: yf_symbol = "GC=F" # Gold Futures
+
+        # Fetch data
+        period = "1mo"
+        interval = "1h"
         
-        if next_low > curr_high:
-            fvg_zone = (curr_high, next_low)
-            fvg_type = "BULLISH_FVG"
-            
-        curr_low = float(recent_data.iloc[i]['low'])
-        next_high = float(recent_data.iloc[i+2]['high'])
+        # We always fetch 1h first, then resample if needed
+        df = yf.download(tickers=yf_symbol, period=period, interval=interval, progress=False)
         
-        if next_high < curr_low:
-            fvg_zone = (next_high, curr_low)
-            fvg_type = "BEARISH_FVG"
-            
-    return fvg_type, fvg_zone
+        if df.empty: return pd.DataFrame()
+
+        # Flatten MultiIndex columns if present (Fix for recent yfinance update)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        df = df.rename(columns={'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'})
+        df.index.name = 'timestamp'
+
+        # Resample for 4H or Daily
+        if timeframe == "4h":
+            df = df.resample('4h').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'})
+        elif timeframe == "1d":
+            df = df.resample('1d').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'})
+
+        return df.dropna()
+    except Exception as e:
+        print(f"⚠️ Yahoo Fetch Error for {symbol}: {e}")
+        return pd.DataFrame()
 
 def fetch_data_safe(symbol, timeframe):
-    max_retries = 3
-    # Helper to fix symbol names if needed
-    check_symbol = symbol
-    if "BTC" in symbol: check_symbol = "BTC/USD"
-    
-    for attempt in range(max_retries):
-        try:
-            if not exchange.markets: exchange.load_markets()
-            
-            # Check if symbol exists in Kraken, if not try swapping /
-            market_id = check_symbol
-            if check_symbol in exchange.markets:
-                market_id = exchange.market(check_symbol)['id']
-                
-            ohlcv = exchange.fetch_ohlcv(market_id, timeframe, limit=100)
+    """Tries Kraken first, then switches to Yahoo Finance if needed."""
+    # 1. Try Kraken
+    try:
+        if not exchange.markets: exchange.load_markets()
+        # Search for symbol in Kraken markets
+        found_id = None
+        for key in exchange.markets.keys():
+            if symbol in key:
+                found_id = exchange.markets[key]['id']
+                break
+        
+        if found_id:
+            ohlcv = exchange.fetch_ohlcv(found_id, timeframe, limit=300)
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             df.set_index('timestamp', inplace=True)
+            df = add_technical_indicators(df)
             return df.dropna()
-        except Exception:
-            if attempt < max_retries - 1: time.sleep(5)
-    return pd.DataFrame()
+    except:
+        pass # Kraken failed, proceed to fallback
+
+    # 2. Fallback to Yahoo Finance (For AUD/CAD, GBP/JPY etc)
+    print(f"🔄 Switching to Backup Data (Yahoo) for {symbol}...")
+    df = fetch_yfinance_data(symbol, timeframe)
+    df = add_technical_indicators(df)
+    return df
 
 # =========================================================================
-# === MASTER LOGIC ===
+# === SIGNAL LOGIC ===
 # =========================================================================
 
-def generate_and_send_signal(symbol, force_send=False):
+def determine_signal_strength(row_4h, row_1h, cpr_data):
+    score = 0
+    price = row_4h['close']
+    
+    # Trend (4H)
+    if price > row_4h['ema_200']: score += 1
+    else: score -= 1
+    
+    if row_4h['ema_50'] > row_4h['ema_200']: score += 1
+    else: score -= 1
+
+    # Momentum
+    rsi = row_4h['rsi']
+    if 50 < rsi < 70: score += 0.5 
+    elif rsi < 30: score += 0.5
+    elif rsi > 70: score -= 0.5
+    elif 30 < rsi < 50: score -= 0.5
+
+    if row_4h['macd'] > row_4h['signal_line']: score += 1
+    else: score -= 1
+
+    # Price Action
+    if price > cpr_data['PP']: score += 0.5
+    else: score -= 0.5
+
+    # Volatility Status
+    vol_status = "Normal"
+    if price > row_4h['bb_upper']: vol_status = "High (Overbought)"
+    elif price < row_4h['bb_lower']: vol_status = "High (Oversold)"
+    
+    if score >= 3: return "STRONG BUY", "🚀", score, vol_status
+    elif 1 <= score < 3: return "BUY", "🟢", score, vol_status
+    elif -3 < score <= -1: return "SELL", "🔴", score, vol_status
+    elif score <= -3: return "STRONG SELL", "🔻", score, vol_status
+    else: return "NEUTRAL", "⚖️", score, vol_status
+
+def generate_and_send_signal(symbol):
     global bot_stats
     try:
-        df_htf = fetch_data_safe(symbol, TIMEFRAME_HTF)
-        df_ltf = fetch_data_safe(symbol, TIMEFRAME_LTF)
-        if df_htf.empty or df_ltf.empty: return
-
-        current_price = float(df_ltf.iloc[-1]['close'])
-        structure_htf = detect_structure(df_htf)
+        # Fetch Data
+        df_4h = fetch_data_safe(symbol, TIMEFRAME_MAIN)
+        df_1h = fetch_data_safe(symbol, TIMEFRAME_ENTRY)
         
-        df_ltf['atr'] = calculate_atr(df_ltf)
-        current_atr = float(df_ltf.iloc[-1]['atr'])
-        fvg_type, fvg_zone = detect_fvg(df_ltf)
+        # Fetch Daily for CPR
+        # For CPR we try to get daily data from the same source
+        df_d = fetch_data_safe(symbol, "1d") 
+        cpr = calculate_cpr_levels(df_d)
 
-        signal = "NEUTRAL (WAIT)"
-        signal_color = "⚪️"
-        
-        # --- LOGIC ---
-        if structure_htf == "BULLISH" and fvg_type == "BULLISH_FVG":
-            signal = "STRONG BUY"
-            signal_color = "🟢"
-            stop_loss = current_price - (1.5 * current_atr)
-            take_profit_1 = current_price + (2.0 * current_atr)
-            take_profit_2 = current_price + (3.5 * current_atr)
-            
-        elif structure_htf == "BEARISH" and fvg_type == "BEARISH_FVG":
-            signal = "STRONG SELL"
-            signal_color = "🔴"
-            stop_loss = current_price + (1.5 * current_atr)
-            take_profit_1 = current_price - (2.0 * current_atr)
-            take_profit_2 = current_price - (3.5 * current_atr)
-            
-        else:
-            # If not a strong signal, ONLY send if it's the startup check (force_send)
-            if not force_send:
-                return 
-            
-            # Generate estimated levels for the status report
-            if structure_htf == "BULLISH":
-                stop_loss = current_price - (2.0 * current_atr)
-                take_profit_1 = current_price + (2.0 * current_atr)
-                take_profit_2 = current_price + (3.0 * current_atr)
-            else:
-                stop_loss = current_price + (2.0 * current_atr)
-                take_profit_1 = current_price - (2.0 * current_atr)
-                take_profit_2 = current_price - (3.0 * current_atr)
+        if df_4h.empty or df_1h.empty or cpr is None: 
+            print(f"⚠️ No data found for {symbol}")
+            return
 
-        # Decimals
-        if "JPY" in symbol: dec = 3
-        elif "BTC" in symbol or "XAU" in symbol: dec = 2
-        else: dec = 5
+        last_4h = df_4h.iloc[-1]
+        last_1h = df_1h.iloc[-1]
+        price = last_4h['close']
         
-        if fvg_zone:
-            zone_txt = f"{fvg_zone[0]:.{dec}f} - {fvg_zone[1]:.{dec}f}"
-        else:
-            zone_txt = "None"
+        signal, emoji, score, vol_status = determine_signal_strength(last_4h, last_1h, cpr)
+        
+        # Targets
+        is_buy = score > 0
+        tp1 = cpr['R1'] if is_buy else cpr['S1']
+        tp2 = cpr['R2'] if is_buy else cpr['S2']
+        atr_sl = last_4h['atr'] * 1.5
+        sl = price - atr_sl if is_buy else price + atr_sl
+        
+        fmt = ",.2f"
 
         message = (
-            f"<b>💎 PREMIUM QUANT SIGNAL</b>\n"
-            f"──────────────────────\n"
-            f"<b>🪙 ASSET:</b> #{symbol.replace('/','')}\n"
-            f"<b>💵 PRICE:</b> <code>{current_price:.{dec}f}</code>\n"
-            f"──────────────────────\n"
-            f"<b>👉 DIRECTION: {signal_color} {signal}</b>\n"
-            f"──────────────────────\n"
-            f"<b>🎯 TP 1:</b> <code>{take_profit_1:.{dec}f}</code>\n"
-            f"<b>🚀 TP 2:</b> <code>{take_profit_2:.{dec}f}</code>\n"
-            f"<b>🛑 SL:</b>  <code>{stop_loss:.{dec}f}</code>\n"
-            f"──────────────────────\n"
-            f"<b>📊 CONFLUENCE:</b>\n"
-            f"• <b>Trend:</b> {structure_htf}\n"
-            f"• <b>Zone:</b> {zone_txt}\n"
+            f"╔════════════════════════════════╗\n"
+            f"  🏆 <b>NILESH FOREX & GOLD AI</b>\n"
+            f"╚════════════════════════════════╝\n\n"
+            f"<b>Asset:</b> {symbol}\n"
+            f"<b>Price:</b> <code>{price:{fmt}}</code>\n"
+            f"<b>Volatility:</b> {vol_status}\n\n"
+            f"--- 🚨 {emoji} <b>{signal}</b> 🚨 ---\n\n"
+            f"<b>📊 METRICS:</b>\n"
+            f"• <b>Trend (200 EMA):</b> {'BULLISH' if price > last_4h['ema_200'] else 'BEARISH'}\n"
+            f"• <b>RSI (4h):</b> <code>{last_4h['rsi']:.1f}</code>\n"
+            f"• <b>MACD:</b> {'Bullish' if last_4h['macd'] > last_4h['signal_line'] else 'Bearish'}\n"
+            f"• <b>Pivot:</b> {'Above' if price > cpr['PP'] else 'Below'} PP\n\n"
+            f"<b>🎯 LEVELS:</b>\n"
+            f"✅ <b>TP 1:</b> <code>{tp1:{fmt}}</code>\n"
+            f"🔥 <b>TP 2:</b> <code>{tp2:{fmt}}</code>\n"
+            f"🛑 <b>SL:</b> <code>{sl:{fmt}}</code>\n\n"
+            f"----------------------------------------\n"
+            f"<i>Powered by Nilesh System</i>"
         )
-        send_telegram_message(message)
+
+        asyncio.run(bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode='HTML'))
         bot_stats['total_analyses'] += 1
         bot_stats['last_analysis'] = datetime.now().isoformat()
+        print(f"✅ Signal sent for {symbol}")
 
     except Exception as e:
-        print(f"❌ Analysis failed for {symbol}: {e}")
+        print(f"❌ Error {symbol}: {e}")
+        traceback.print_exc()
 
 # =========================================================================
-# === RUNNER ===
+# === STARTUP ===
 # =========================================================================
-
-def keep_alive():
-    if APP_URL:
-        try: requests.get(f"{APP_URL}/health", timeout=5)
-        except: pass
 
 def start_bot():
     print(f"🚀 Initializing {bot_stats['version']}...")
-    
-    # 1. Notify User (and list pairs)
-    threading.Thread(target=send_startup_message).start()
-
     scheduler = BackgroundScheduler()
     
-    # 2. Main Signal Scan
-    for s in FOREX_PAIRS:
-        scheduler.add_job(generate_and_send_signal, 'cron', minute='0,30', args=[s, False])
-        
-    scheduler.add_job(send_heartbeat, 'interval', hours=4)
-    scheduler.add_job(keep_alive, 'interval', minutes=10)
+    for idx, s in enumerate(CRYPTOS):
+        # Run every 30 mins
+        scheduler.add_job(generate_and_send_signal, 'cron', minute='0,30', second=idx*5, args=[s])
+    
     scheduler.start()
     
-    # 3. FORCE SEND ON STARTUP (So you see all pairs working immediately)
-    for s in FOREX_PAIRS:
-        threading.Thread(target=generate_and_send_signal, args=(s, True)).start()
+    # Immediate check
+    for s in CRYPTOS:
+        threading.Thread(target=generate_and_send_signal, args=(s,)).start()
 
 start_bot()
 
@@ -269,12 +281,8 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return render_template_string("<h3>Bot is Running V2.11</h3>")
-
-@app.route('/health')
-def health(): return jsonify({"status": "healthy"}), 200
+    return render_template_string("<h1>Nilesh Bot Running</h1><p>Active</p>")
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
-
