@@ -1,10 +1,10 @@
-# main.py - PREMIER FOREX AI QUANT V2.10 (HTTP-Based & Stable)
+# main.py - PREMIER FOREX AI QUANT V2.11 (Fixed Pair List)
 
 import os
 import ccxt
 import pandas as pd
 import numpy as np
-import requests # <--- Switched to requests for 100% stability
+import requests
 import threading
 import time
 from datetime import datetime
@@ -17,13 +17,16 @@ load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-DEFAULT_PAIRS = "EUR/USD,GBP/JPY,AUD/USD,GBP/USD,XAU/USD,AUD/CAD,AUD/JPY,BTC/USD"
+
+# UPDATED: Added GBP/JPY and AUD/CAD specifically for you
+DEFAULT_PAIRS = "EUR/USD,GBP/USD,USD/JPY,XAU/USD,BTC/USD,GBP/JPY,AUD/CAD"
 FOREX_PAIRS = [p.strip() for p in os.getenv("FOREX_PAIRS", DEFAULT_PAIRS).split(',')]
 APP_URL = os.getenv("RENDER_EXTERNAL_URL") 
 
 TIMEFRAME_HTF = "4h"
 TIMEFRAME_LTF = "1h"
 
+# Initialize Kraken
 exchange = ccxt.kraken({
     'enableRateLimit': True, 
     'rateLimit': 2000,
@@ -34,18 +37,14 @@ bot_stats = {
     "status": "initializing",
     "total_analyses": 0,
     "last_analysis": None,
-    "version": "V2.10 Stable HTTP"
+    "version": "V2.11 Custom Pairs"
 }
 
 # =========================================================================
-# === TELEGRAM ENGINE (Requests-Based / Crash Proof) ===
+# === TELEGRAM ENGINE (HTTP Direct) ===
 # =========================================================================
 
 def send_telegram_message(message):
-    """
-    Sends message using direct HTTP Request.
-    This bypasses asyncio event loops completely, fixing the 'Loop Closed' crash.
-    """
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {
@@ -58,27 +57,27 @@ def send_telegram_message(message):
         print(f"⚠️ Telegram Send Error: {e}")
 
 def send_startup_message():
+    # Lists the actual pairs being monitored so you can verify
+    pairs_formatted = "\n".join([f"• {p}" for p in FOREX_PAIRS])
     msg = (
-        f"🟢 <b>SYSTEM ONLINE: V2.10 (Stable)</b>\n"
+        f"🟢 <b>SYSTEM ONLINE: V2.11</b>\n"
         f"───────────────────\n"
-        f"✅ <b>Pairs:</b> {len(FOREX_PAIRS)} Active\n"
-        f"✅ <b>Mode:</b> HTTP Direct (Crash Proof)\n"
+        f"<b>Monitoring {len(FOREX_PAIRS)} Assets:</b>\n"
+        f"{pairs_formatted}\n"
         f"───────────────────\n"
-        f"<i>Running initial scan now...</i>"
+        f"<i>Sending initial status report now...</i>"
     )
     send_telegram_message(msg)
 
 def send_heartbeat():
-    """Periodic message to confirm bot is alive."""
-    last_time = "Just Started"
     if bot_stats['last_analysis']:
         last_time = datetime.fromisoformat(bot_stats['last_analysis']).strftime("%H:%M")
-        
+    else:
+        last_time = "Just Started"
     msg = (
         f"💓 <b>SYSTEM HEARTBEAT</b>\n"
         f"Status: 🟢 Running\n"
         f"Last Scan: {last_time} UTC\n"
-        f"<i>Scanning for high-probability setups...</i>"
     )
     send_telegram_message(msg)
 
@@ -111,7 +110,6 @@ def detect_fvg(df):
     fvg_zone = None
     fvg_type = None
     for i in range(len(recent_data) - 2):
-        # Force float conversion to fix 'np.float64' error
         curr_high = float(recent_data.iloc[i]['high'])
         next_low = float(recent_data.iloc[i+2]['low'])
         
@@ -130,13 +128,19 @@ def detect_fvg(df):
 
 def fetch_data_safe(symbol, timeframe):
     max_retries = 3
-    # Kraken Symbol Correction
-    check_symbol = "BTC/USD" if "BTC" in symbol else symbol
+    # Helper to fix symbol names if needed
+    check_symbol = symbol
+    if "BTC" in symbol: check_symbol = "BTC/USD"
     
     for attempt in range(max_retries):
         try:
             if not exchange.markets: exchange.load_markets()
-            market_id = exchange.market(check_symbol)['id'] if check_symbol in exchange.markets else check_symbol
+            
+            # Check if symbol exists in Kraken, if not try swapping /
+            market_id = check_symbol
+            if check_symbol in exchange.markets:
+                market_id = exchange.market(check_symbol)['id']
+                
             ohlcv = exchange.fetch_ohlcv(market_id, timeframe, limit=100)
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
@@ -167,24 +171,27 @@ def generate_and_send_signal(symbol, force_send=False):
         signal = "NEUTRAL (WAIT)"
         signal_color = "⚪️"
         
-        # LOGIC:
+        # --- LOGIC ---
         if structure_htf == "BULLISH" and fvg_type == "BULLISH_FVG":
             signal = "STRONG BUY"
             signal_color = "🟢"
             stop_loss = current_price - (1.5 * current_atr)
             take_profit_1 = current_price + (2.0 * current_atr)
             take_profit_2 = current_price + (3.5 * current_atr)
+            
         elif structure_htf == "BEARISH" and fvg_type == "BEARISH_FVG":
             signal = "STRONG SELL"
             signal_color = "🔴"
             stop_loss = current_price + (1.5 * current_atr)
             take_profit_1 = current_price - (2.0 * current_atr)
             take_profit_2 = current_price - (3.5 * current_atr)
+            
         else:
-            # If strictly waiting for Strong signals, skip unless forced
+            # If not a strong signal, ONLY send if it's the startup check (force_send)
             if not force_send:
                 return 
-            # If forced (initial run), generate levels anyway based on structure
+            
+            # Generate estimated levels for the status report
             if structure_htf == "BULLISH":
                 stop_loss = current_price - (2.0 * current_atr)
                 take_profit_1 = current_price + (2.0 * current_atr)
@@ -194,7 +201,7 @@ def generate_and_send_signal(symbol, force_send=False):
                 take_profit_1 = current_price - (2.0 * current_atr)
                 take_profit_2 = current_price - (3.0 * current_atr)
 
-        # Formatting decimals
+        # Decimals
         if "JPY" in symbol: dec = 3
         elif "BTC" in symbol or "XAU" in symbol: dec = 2
         else: dec = 5
@@ -205,7 +212,7 @@ def generate_and_send_signal(symbol, force_send=False):
             zone_txt = "None"
 
         message = (
-            f"<b>💎 PREMIUM AI SIGNAL</b>\n"
+            f"<b>💎 PREMIUM QUANT SIGNAL</b>\n"
             f"──────────────────────\n"
             f"<b>🪙 ASSET:</b> #{symbol.replace('/','')}\n"
             f"<b>💵 PRICE:</b> <code>{current_price:.{dec}f}</code>\n"
@@ -239,24 +246,20 @@ def keep_alive():
 def start_bot():
     print(f"🚀 Initializing {bot_stats['version']}...")
     
-    # 1. Notify User
+    # 1. Notify User (and list pairs)
     threading.Thread(target=send_startup_message).start()
 
     scheduler = BackgroundScheduler()
     
-    # 2. Main Signal Scan (Every 30 mins)
+    # 2. Main Signal Scan
     for s in FOREX_PAIRS:
         scheduler.add_job(generate_and_send_signal, 'cron', minute='0,30', args=[s, False])
         
-    # 3. Heartbeat (Every 4 hours)
     scheduler.add_job(send_heartbeat, 'interval', hours=4)
-    
-    # 4. Anti-Sleep (Every 10 mins)
     scheduler.add_job(keep_alive, 'interval', minutes=10)
-    
     scheduler.start()
     
-    # 5. IMMEDIATE FIRST RUN (Forces a message so you see it works)
+    # 3. FORCE SEND ON STARTUP (So you see all pairs working immediately)
     for s in FOREX_PAIRS:
         threading.Thread(target=generate_and_send_signal, args=(s, True)).start()
 
@@ -266,7 +269,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return render_template_string("<h3>Bot is Running V2.10</h3>")
+    return render_template_string("<h3>Bot is Running V2.11</h3>")
 
 @app.route('/health')
 def health(): return jsonify({"status": "healthy"}), 200
@@ -274,5 +277,3 @@ def health(): return jsonify({"status": "healthy"}), 200
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
-
-
