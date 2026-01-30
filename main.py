@@ -26,17 +26,12 @@ WATCHLIST = [
 ]
 TIMEFRAME = "1h"
 
-# =========================================================================
-# === FLASK APP ===
-# =========================================================================
 app = Flask(__name__)
-
 @app.route('/')
-def home():
-    return "Nilesh Bot V23 (Debug Mode Active)"
+def home(): return "Nilesh Bot V25 (Ultra-Premium Design)"
 
 # =========================================================================
-# === DATA ENGINE WITH ERROR REPORTING ===
+# === DATA ENGINE ===
 # =========================================================================
 
 def fetch_data(symbol):
@@ -46,11 +41,8 @@ def fetch_data(symbol):
         response = requests.get(url, params=params)
         data = response.json()
         
-        # DEBUG: Check if API returned an error
-        if "code" in data and data["code"] == 429:
-            return "RATE_LIMIT"
-        if "values" not in data:
-            return "NO_DATA"
+        if "code" in data and data["code"] == 429: return "RATE_LIMIT"
+        if "values" not in data: return "NO_DATA"
             
         df = pd.DataFrame(data["values"])
         df['datetime'] = pd.to_datetime(df['datetime'])
@@ -58,7 +50,6 @@ def fetch_data(symbol):
         df = df.iloc[::-1]
         df[['open', 'high', 'low', 'close']] = df[['open', 'high', 'low', 'close']].astype(float)
         
-        # Add Indicators
         df['ema_200'] = df['close'].ewm(span=200, adjust=False).mean()
         delta = df['close'].diff()
         up, down = delta.clip(lower=0), -1 * delta.clip(upper=0)
@@ -73,72 +64,97 @@ def fetch_data(symbol):
         low_close = np.abs(df['low'] - df['close'].shift())
         df['atr'] = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1).rolling(14).mean()
         return df.dropna()
-    except Exception as e:
-        return f"ERROR: {str(e)}"
+    except Exception as e: return f"ERROR: {str(e)}"
 
 def calculate_cpr(df):
     try:
         df_daily = df.resample('D').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'}).dropna()
         if len(df_daily) < 2: return None
         prev = df_daily.iloc[-2]
-        PP = (prev['high'] + prev['low'] + prev['close']) / 3.0
-        return {'PP': PP, 'R1': 2*PP - prev['low'], 'S1': 2*PP - prev['high']}
+        H, L, C = prev['high'], prev['low'], prev['close']
+        PP = (H + L + C) / 3.0
+        R1, S1 = (2 * PP) - L, (2 * PP) - H
+        R2, S2 = PP + (H - L), PP - (H - L) # Fixed Math
+        return {'PP': PP, 'R1': R1, 'S1': S1, 'R2': R2, 'S2': S2}
     except: return None
 
 # =========================================================================
-# === CARD DESIGNER ===
+# === V25 ULTRA-PREMIUM DESIGNER ===
 # =========================================================================
 
+def get_flags(symbol):
+    """Adds currency flags for visual appeal."""
+    base, quote = symbol.split('/')
+    flags = {
+        "EUR": "🇪🇺", "USD": "🇺🇸", "GBP": "🇬🇧", "JPY": "🇯🇵",
+        "AUD": "🇦🇺", "CAD": "🇨🇦", "XAU": "🥇", "BTC": "🅱️"
+    }
+    return f"{flags.get(base, '')}{flags.get(quote, '')}"
+
 def format_premium_card(symbol, signal, price, rsi, trend, tp1, tp2, sl):
+    # 1. Theme & Header Setup
     if "STRONG BUY" in signal:
-        header, theme, bar = "⚡ <b>INSTITUTIONAL BUY</b>", "🟢", "🟩🟩🟩🟩🟩"
+        header = "🔴💎 <b>INSTITUTIONAL BUY DETECTED</b> 💎🔴"
+        side, theme_color = "LONG 🟢", "🟢"
+        bar, urgency = "🟩🟩🟩🟩🟩 MAXIMUM", "(💎 Oversold bounce)" if rsi < 30 else ""
     elif "STRONG SELL" in signal:
-        header, theme, bar = "⚡ <b>INSTITUTIONAL SELL</b>", "🔴", "🟥🟥🟥🟥🟥"
+        header = "🔴💎 <b>INSTITUTIONAL SELL DETECTED</b> 💎🔴"
+        side, theme_color = "SHORT 🔴", "🔴"
+        bar, urgency = "🟥🟥🟥🟥🟥 MAXIMUM", "(💎 Overbought rejection)" if rsi > 70 else ""
     elif "BUY" in signal:
-        header, theme, bar = "🟢 <b>BUY SIGNAL</b>", "🟢", "🟩🟩🟩⬜⬜"
+        header = "🟢 <b>BUY SIGNAL GENERATED</b> 🟢"
+        side, theme_color = "LONG 🟢", "🟢"
+        bar, urgency = "🟩🟩🟩⬜⬜", ""
     elif "SELL" in signal:
-        header, theme, bar = "🔴 <b>SELL SIGNAL</b>", "🔴", "🟥🟥🟥⬜⬜"
+        header = "🔴 <b>SELL SIGNAL GENERATED</b> 🔴"
+        side, theme_color = "SHORT 🔴", "🔴"
+        bar, urgency = "🟥🟥🟥⬜⬜", ""
     else:
-        header, theme, bar = "⚖️ <b>MARKET NEUTRAL</b>", "⚪", "⬜⬜⬜⬜⬜"
+        header = "⚖️ <b>MARKET NEUTRAL</b> ⚖️"
+        side, theme_color = "WAIT ⚪", "⚪"
+        bar, urgency = "⬜⬜⬜⬜⬜", ""
 
+    # 2. Formatting & Icons
     fmt = ",.2f" if "JPY" in symbol or "XAU" in symbol or "BTC" in symbol else ",.5f"
-    trend_icon = "↗️ Bullish" if "Bullish" in trend else "↘️ Bearish"
-    rsi_status = "Overbought ⚠️" if rsi > 70 else "Oversold 💎" if rsi < 30 else "Neutral"
-
-    return (
-        f"{header}\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n"
-        f"<b>Asset:</b> #{symbol.replace('/', '')}  {theme}\n"
-        f"<b>Price:</b> <code>{price:{fmt}}</code>\n\n"
-        f"📊 <b>MARKET CONTEXT</b>\n├ <b>Trend:</b> {trend_icon}\n├ <b>RSI ({rsi:.0f}):</b> {rsi_status}\n└ <b>Power:</b> {bar}\n\n"
-        f"🎯 <b>KEY LEVELS</b>\n├ <b>TP 1:</b> <code>{tp1:{fmt}}</code>\n├ <b>TP 2:</b> <code>{tp2:{fmt}}</code>\n└ <b>SL:</b>   <code>{sl:{fmt}}</code>\n\n"
-        f"<i>Nilesh Quant V23</i>"
+    flags = get_flags(symbol)
+    trend_icon = "↗️ Bullish Momentum" if "Bullish" in trend else "↘️ Bearish Momentum"
+    
+    # 3. The V25 Layout
+    msg = (
+        f"{header}\n"
+        f"〰️〰️〰️〰️〰️〰️〰️〰️〰️〰️\n"
+        f"┏ {flags} <b>{symbol}</b> 🔸 <b>{side}</b> ┓\n"
+        f"┗ 💵 <b>ENTRY:</b> <code>{price:{fmt}}</code> ┛\n\n"
+        
+        f"📊 <b>MARKET INTEL</b>\n"
+        f"• <b>Trend:</b> {trend_icon}\n"
+        f"• <b>RSI:</b> <code>{rsi:.0f}</code> {urgency}\n"
+        f"• <b>Strength:</b> {bar}\n\n"
+        
+        f"🎯 <b>PROFIT TARGETS</b>\n"
+        f"🥇 <b>TP1:</b> <code>{tp1:{fmt}}</code>\n"
+        f"🥈 <b>TP2:</b> <code>{tp2:{fmt}}</code>\n\n"
+        
+        f"🛡️ <b>RISK MANAGEMENT</b>\n"
+        f"🧱 <b>SL:</b> <code>{sl:{fmt}}</code>\n"
+        f"〰️〰️〰️〰️〰️〰️〰️〰️〰️〰️\n"
+        f"<i>🤖 Nilesh Quant AI • V25 Premium</i>"
     )
+    return msg
 
 async def run_analysis_cycle(app_instance):
     print(f"🔄 Scanning 8 Pairs... {datetime.now()}")
     for symbol in WATCHLIST:
         try:
-            # Tell user we are checking...
-            # await app_instance.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"🔍 Checking {symbol}...")
-            
             df = fetch_data(symbol)
-            
-            # --- DEBUGGING HANDLERS ---
             if isinstance(df, str):
-                if df == "RATE_LIMIT":
-                    await app_instance.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"⚠️ <b>API LIMIT HIT</b> for {symbol}.\nWaiting 60s to cool down...", parse_mode='HTML')
-                    time.sleep(60)
-                    continue
-                elif df == "NO_DATA":
-                    await app_instance.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"⚠️ <b>NO DATA</b> returned for {symbol}. Check symbol name.", parse_mode='HTML')
-                    time.sleep(5)
-                    continue
-                else:
-                    await app_instance.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"⚠️ <b>ERROR</b> for {symbol}: {df}", parse_mode='HTML')
-                    time.sleep(5)
-                    continue
+                 print(f"Skipping {symbol}: {df}")
+                 time.sleep(5)
+                 continue
 
             cpr = calculate_cpr(df)
+            if not cpr: continue
+
             last = df.iloc[-1]
             price = last['close']
             
@@ -153,7 +169,7 @@ async def run_analysis_cycle(app_instance):
             elif rsi < 30: score += 0.5
             elif rsi > 70: score -= 0.5
             elif 30 < rsi < 50: score -= 0.5
-            if cpr and price > cpr['PP']: score += 0.5
+            if price > cpr['PP']: score += 0.5
             else: score -= 0.5
 
             signal = "WAIT (Neutral)"
@@ -171,59 +187,54 @@ async def run_analysis_cycle(app_instance):
             if msg:
                 await app_instance.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode='HTML')
 
-            # CRITICAL: 15s wait to ensure we don't hit 8 requests/minute limit
+            # Wait 15s to respect API limits
             time.sleep(15)
             
         except Exception as e:
-            await app_instance.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"❌ CRITICAL ERROR {symbol}: {e}")
+            print(f"❌ ERROR {symbol}: {e}")
 
 # =========================================================================
 # === BOT ENGINE ===
 # =========================================================================
 
 async def start_command(update, context):
-    await update.message.reply_text("👋 <b>Nilesh V23 Online</b>", parse_mode='HTML')
+    await update.message.reply_text("👋 <b>Nilesh V25 Online</b>", parse_mode='HTML')
 
 def start_bot_process():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     
-    # 1. Clear Webhooks
+    # Clear Webhooks
     temp_bot = Bot(token=TELEGRAM_BOT_TOKEN)
     try: loop.run_until_complete(temp_bot.delete_webhook(drop_pending_updates=True))
     except: pass
 
-    # 2. Setup App
+    # App
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start_command))
 
-    # 3. Send Startup Msg
     try:
         loop.run_until_complete(application.bot.send_message(
             chat_id=TELEGRAM_CHAT_ID, 
-            text="🚀 <b>SYSTEM RESTORED (DEBUG MODE)</b>\nScanning will be slower (15s delay) to ensure stability.", 
+            text="🚀 <b>SYSTEM RESTORED (V25 ULTRA-PREMIUM)</b>\nMath fixed. Design upgraded. Sending cards...", 
             parse_mode='HTML'
         ))
     except: pass
 
-    # 4. INSTANT TRIGGER
+    # Triggers
     loop.create_task(run_analysis_cycle(application))
 
-    # 5. Schedule Future Scans
     scheduler = BackgroundScheduler()
     scheduler.add_job(lambda: asyncio.run_coroutine_threadsafe(run_analysis_cycle(application), loop), 'interval', minutes=30)
     scheduler.start()
 
-    # 6. Start Polling
-    print("✅ Bot Polling Started")
+    # Poll
     while True:
         try:
             application.run_polling(stop_signals=None, close_loop=False)
         except Conflict:
-            print("⚠️ CONFLICT: Waiting 15s...")
             time.sleep(15)
         except Exception as e:
-            print(f"⚠️ Error: {e}")
             time.sleep(10)
 
 if os.environ.get("WERKZEUG_RUN_MAIN") != "true":
