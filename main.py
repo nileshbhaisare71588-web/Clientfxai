@@ -28,7 +28,7 @@ TIMEFRAME = "1h"
 
 app = Flask(__name__)
 @app.route('/')
-def home(): return "Nilesh Bot V25 (Ultra-Premium Design)"
+def home(): return "AI Bot V25"
 
 # =========================================================================
 # === DATA ENGINE ===
@@ -94,19 +94,19 @@ def get_flags(symbol):
 def format_premium_card(symbol, signal, price, rsi, trend, tp1, tp2, sl):
     # 1. Theme & Header Setup
     if "STRONG BUY" in signal:
-        header = "🔴💎 <b>INSTITUTIONAL BUY DETECTED</b> 💎🔴"
+        header = "🔴💎 <b>INSTITUTIONAL BUY</b> 💎🔴"
         side, theme_color = "LONG 🟢", "🟢"
         bar, urgency = "🟩🟩🟩🟩🟩 MAXIMUM", "(💎 Oversold bounce)" if rsi < 30 else ""
     elif "STRONG SELL" in signal:
-        header = "🔴💎 <b>INSTITUTIONAL SELL DETECTED</b> 💎🔴"
+        header = "🔴💎 <b>INSTITUTIONAL SELL</b> 💎🔴"
         side, theme_color = "SHORT 🔴", "🔴"
         bar, urgency = "🟥🟥🟥🟥🟥 MAXIMUM", "(💎 Overbought rejection)" if rsi > 70 else ""
     elif "BUY" in signal:
-        header = "🟢 <b>BUY SIGNAL GENERATED</b> 🟢"
+        header = "🟢 <b>BUY SIGNAL</b> 🟢"
         side, theme_color = "LONG 🟢", "🟢"
         bar, urgency = "🟩🟩🟩⬜⬜", ""
     elif "SELL" in signal:
-        header = "🔴 <b>SELL SIGNAL GENERATED</b> 🔴"
+        header = "🔴 <b>SELL SIGNAL</b> 🔴"
         side, theme_color = "SHORT 🔴", "🔴"
         bar, urgency = "🟥🟥🟥⬜⬜", ""
     else:
@@ -138,7 +138,7 @@ def format_premium_card(symbol, signal, price, rsi, trend, tp1, tp2, sl):
         f"🛡️ <b>RISK MANAGEMENT</b>\n"
         f"🧱 <b>SL:</b> <code>{sl:{fmt}}</code>\n"
         f"〰️〰️〰️〰️〰️〰️〰️〰️〰️〰️\n"
-        f"<i>🤖 Nilesh Quant AI • V25 Premium</i>"
+        f"<i>🤖 AI BOT • V25 Premium</i>"
     )
     return msg
 
@@ -198,7 +198,7 @@ async def run_analysis_cycle(app_instance):
 # =========================================================================
 
 async def start_command(update, context):
-    await update.message.reply_text("👋 <b>Nilesh V25 Online</b>", parse_mode='HTML')
+    await update.message.reply_text("👋 <b>AI BOT V25 Online</b>", parse_mode='HTML')
 
 def start_bot_process():
     loop = asyncio.new_event_loop()
@@ -216,7 +216,7 @@ def start_bot_process():
     try:
         loop.run_until_complete(application.bot.send_message(
             chat_id=TELEGRAM_CHAT_ID, 
-            text="🚀 <b>SYSTEM RESTORED (V25 ULTRA-PREMIUM)</b>\nMath fixed. Design upgraded. Sending cards...", 
+            text="🚀 <b>SYSTEM RESTORED (V25 PREMIUM)</b>\nMath fixed. Design upgraded. Sending cards...", 
             parse_mode='HTML'
         ))
     except: pass
@@ -244,3 +244,4 @@ if os.environ.get("WERKZEUG_RUN_MAIN") != "true":
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port, threaded=True)
+
