@@ -26,6 +26,12 @@ WATCHLIST = [
 ]
 TIMEFRAME = "1h"
 
+# =========================================================================
+# === NEW: TRADE TRACKING STORAGE ===
+# =========================================================================
+ACTIVE_TRADES = []  # Stores currently running trades
+TRADE_HISTORY = []  # Stores closed trades for the 12h report
+
 app = Flask(__name__)
 @app.route('/')
 def home(): return "AI Bot V25"
@@ -74,7 +80,7 @@ def calculate_cpr(df):
         H, L, C = prev['high'], prev['low'], prev['close']
         PP = (H + L + C) / 3.0
         R1, S1 = (2 * PP) - L, (2 * PP) - H
-        R2, S2 = PP + (H - L), PP - (H - L) # Fixed Math
+        R2, S2 = PP + (H - L), PP - (H - L) 
         return {'PP': PP, 'R1': R1, 'S1': S1, 'R2': R2, 'S2': S2}
     except: return None
 
@@ -110,9 +116,8 @@ def format_premium_card(symbol, signal, price, rsi, trend, tp1, tp2, sl):
         side, theme_color = "SHORT 🔴", "🔴"
         bar, urgency = "🟥🟥🟥⬜⬜", ""
     else:
-        header = "⚖️ <b>MARKET NEUTRAL</b> ⚖️"
-        side, theme_color = "WAIT ⚪", "⚪"
-        bar, urgency = "⬜⬜⬜⬜⬜", ""
+        # Don't format Neutral cards for trading
+        return None
 
     # 2. Formatting & Icons
     fmt = ",.2f" if "JPY" in symbol or "XAU" in symbol or "BTC" in symbol else ",.5f"
@@ -142,6 +147,91 @@ def format_premium_card(symbol, signal, price, rsi, trend, tp1, tp2, sl):
     )
     return msg
 
+# =========================================================================
+# === NEW: TRADE MONITORING & REPORTING ENGINE ===
+# =========================================================================
+
+async def check_active_trades(app_instance, symbol, current_price):
+    """Checks if any active trade for the symbol has hit TP or SL."""
+    global ACTIVE_TRADES, TRADE_HISTORY
+    
+    # Filter trades for this symbol
+    for trade in ACTIVE_TRADES[:]: # Copy list to safely modify
+        if trade['symbol'] == symbol:
+            result = None
+            pnl = 0
+            
+            # CHECK BUY CONDITIONS
+            if "BUY" in trade['type']:
+                if current_price >= trade['tp']:
+                    result = "WIN 🏆"
+                    pnl = current_price - trade['entry']
+                elif current_price <= trade['sl']:
+                    result = "LOSS ❌"
+                    pnl = trade['sl'] - trade['entry'] # Negative
+            
+            # CHECK SELL CONDITIONS
+            elif "SELL" in trade['type']:
+                if current_price <= trade['tp']:
+                    result = "WIN 🏆"
+                    pnl = trade['entry'] - current_price
+                elif current_price >= trade['sl']:
+                    result = "LOSS ❌"
+                    pnl = trade['entry'] - trade['sl'] # Negative
+
+            # IF OUTCOME DECIDED
+            if result:
+                # Remove from Active, Add to History
+                ACTIVE_TRADES.remove(trade)
+                trade['result'] = result
+                trade['exit_price'] = current_price
+                trade['close_time'] = datetime.now()
+                TRADE_HISTORY.append(trade)
+                
+                # Send Notification
+                flags = get_flags(symbol)
+                outcome_header = "💚 <b>TAKE PROFIT SMASHED!</b> 💚" if "WIN" in result else "🔻 <b>STOP LOSS HIT</b> 🔻"
+                
+                msg = (
+                    f"{outcome_header}\n"
+                    f"〰️〰️〰️〰️〰️〰️〰️〰️〰️〰️\n"
+                    f"┏ {flags} <b>{symbol}</b> 🔸 {result} ┓\n"
+                    f"┃ 🚪 <b>Entry:</b> <code>{trade['entry']}</code>\n"
+                    f"┃ 🏁 <b>Exit:</b> <code>{current_price}</code>\n"
+                    f"┗ 🎰 <b>Type:</b> {trade['type']}\n\n"
+                    f"<i>Trade Closed. Check Report for stats.</i>"
+                )
+                await app_instance.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode='HTML')
+
+async def send_12h_report(app_instance):
+    """Generates a Win/Loss report every 12 hours."""
+    global TRADE_HISTORY
+    
+    if not TRADE_HISTORY:
+        return # No trades to report
+        
+    wins = sum(1 for t in TRADE_HISTORY if "WIN" in t['result'])
+    losses = sum(1 for t in TRADE_HISTORY if "LOSS" in t['result'])
+    total = wins + losses
+    win_rate = (wins / total * 100) if total > 0 else 0
+    
+    report_msg = (
+        f"📑 <b>12-HOUR PERFORMANCE REPORT</b> 📑\n"
+        f"〰️〰️〰️〰️〰️〰️〰️〰️〰️〰️\n"
+        f"🏆 <b>WINS:</b> {wins}\n"
+        f"❌ <b>LOSSES:</b> {losses}\n"
+        f"📊 <b>WIN RATE:</b> {win_rate:.1f}%\n"
+        f"〰️〰️〰️〰️〰️〰️〰️〰️〰️〰️\n"
+        f"<i>Clearing history for next session...</i>"
+    )
+    
+    await app_instance.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=report_msg, parse_mode='HTML')
+    TRADE_HISTORY.clear() # Reset for next 12 hours
+
+# =========================================================================
+# === ANALYSIS CYCLE ===
+# =========================================================================
+
 async def run_analysis_cycle(app_instance):
     print(f"🔄 Scanning 8 Pairs... {datetime.now()}")
     for symbol in WATCHLIST:
@@ -158,6 +248,15 @@ async def run_analysis_cycle(app_instance):
             last = df.iloc[-1]
             price = last['close']
             
+            # --- NEW: CHECK EXISTING TRADES FIRST ---
+            await check_active_trades(app_instance, symbol, price)
+            
+            # If we already have a trade running for this symbol, DO NOT generate a new signal
+            # This prevents multiple overlapping trades on the same pair
+            if any(t['symbol'] == symbol for t in ACTIVE_TRADES):
+                continue
+            
+            # --- SIGNAL GENERATION ---
             score = 0
             if price > last['ema_200']: score += 1
             else: score -= 1
@@ -183,8 +282,21 @@ async def run_analysis_cycle(app_instance):
             sl = price - (last['atr'] * 1.5) if score > 0 else price + (last['atr'] * 1.5)
             trend = "Bullish" if price > last['ema_200'] else "Bearish"
 
+            # Only send message if it's not Neutral
             msg = format_premium_card(symbol, signal, price, rsi, trend, tp1, tp2, sl)
+            
             if msg:
+                # --- NEW: REGISTER THE TRADE ---
+                new_trade = {
+                    'symbol': symbol,
+                    'type': signal, # BUY or SELL
+                    'entry': price,
+                    'tp': tp2, # Using TP2 as the target for win/loss calculation
+                    'sl': sl,
+                    'start_time': datetime.now()
+                }
+                ACTIVE_TRADES.append(new_trade)
+                
                 await app_instance.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode='HTML')
 
             # Wait 15s to respect API limits
@@ -216,7 +328,7 @@ def start_bot_process():
     try:
         loop.run_until_complete(application.bot.send_message(
             chat_id=TELEGRAM_CHAT_ID, 
-            text="🚀 <b>SYSTEM RESTORED (V25 PREMIUM)</b>\nMath fixed. Design upgraded. Sending cards...", 
+            text="🚀 <b>SYSTEM RESTORED (V25 PREMIUM)</b>\nFeature Added: Trade Tracker & 12H Reports.", 
             parse_mode='HTML'
         ))
     except: pass
@@ -225,7 +337,12 @@ def start_bot_process():
     loop.create_task(run_analysis_cycle(application))
 
     scheduler = BackgroundScheduler()
+    # Analysis Job (every 30 mins)
     scheduler.add_job(lambda: asyncio.run_coroutine_threadsafe(run_analysis_cycle(application), loop), 'interval', minutes=30)
+    
+    # --- NEW: 12-HOUR REPORT JOB ---
+    scheduler.add_job(lambda: asyncio.run_coroutine_threadsafe(send_12h_report(application), loop), 'interval', hours=12)
+    
     scheduler.start()
 
     # Poll
@@ -244,4 +361,3 @@ if os.environ.get("WERKZEUG_RUN_MAIN") != "true":
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port, threaded=True)
-
