@@ -337,8 +337,8 @@ def start_bot_process():
     loop.create_task(run_analysis_cycle(application))
 
     scheduler = BackgroundScheduler()
-    # Analysis Job (every 30 mins)
-    scheduler.add_job(lambda: asyncio.run_coroutine_threadsafe(run_analysis_cycle(application), loop), 'interval', minutes=30)
+    # Analysis Job (every 1 Hour)
+    scheduler.add_job(lambda: asyncio.run_coroutine_threadsafe(run_analysis_cycle(application), loop), 'interval', minutes=55)
     
     # --- NEW: 12-HOUR REPORT JOB ---
     scheduler.add_job(lambda: asyncio.run_coroutine_threadsafe(send_12h_report(application), loop), 'interval', hours=12)
@@ -361,3 +361,4 @@ if os.environ.get("WERKZEUG_RUN_MAIN") != "true":
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port, threaded=True)
+
