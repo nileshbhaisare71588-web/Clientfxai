@@ -5,7 +5,7 @@ import numpy as np
 import asyncio
 import time
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
 from telegram import Bot
 from telegram.ext import Application, CommandHandler
@@ -26,23 +26,21 @@ WATCHLIST = [
 ]
 TIMEFRAME = "1h"
 
-# =========================================================================
-# === NEW: TRADE TRACKING STORAGE ===
-# =========================================================================
-ACTIVE_TRADES = []  # Stores currently running trades
-TRADE_HISTORY = []  # Stores closed trades for the 12h report
+# --- STATE MANAGEMENT ---
+ACTIVE_TRADES = {}
+TRADE_HISTORY = []
 
 app = Flask(__name__)
 @app.route('/')
-def home(): return "AI Bot V25"
+def home(): return "AI Bot V25 Sniper Edition"
 
 # =========================================================================
-# === DATA ENGINE ===
+# === DATA ENGINE (UPGRADED) ===
 # =========================================================================
 
 def fetch_data(symbol):
     url = "https://api.twelvedata.com/time_series"
-    params = {"symbol": symbol, "interval": TIMEFRAME, "apikey": TD_API_KEY, "outputsize": 60}
+    params = {"symbol": symbol, "interval": TIMEFRAME, "apikey": TD_API_KEY, "outputsize": 100} # Increased for ADX
     try:
         response = requests.get(url, params=params)
         data = response.json()
@@ -56,19 +54,46 @@ def fetch_data(symbol):
         df = df.iloc[::-1]
         df[['open', 'high', 'low', 'close']] = df[['open', 'high', 'low', 'close']].astype(float)
         
+        # --- 1. TREND INDICATORS ---
+        df['ema_50'] = df['close'].ewm(span=50, adjust=False).mean()
         df['ema_200'] = df['close'].ewm(span=200, adjust=False).mean()
+        
+        # --- 2. RSI ---
         delta = df['close'].diff()
         up, down = delta.clip(lower=0), -1 * delta.clip(upper=0)
         rs = up.ewm(com=13, adjust=False).mean() / down.ewm(com=13, adjust=False).mean()
         df['rsi'] = 100 - (100 / (1 + rs))
+        
+        # --- 3. MACD ---
         exp1 = df['close'].ewm(span=12, adjust=False).mean()
         exp2 = df['close'].ewm(span=26, adjust=False).mean()
         df['macd'] = exp1 - exp2
         df['signal_line'] = df['macd'].ewm(span=9, adjust=False).mean()
+        
+        # --- 4. ATR (Volatility) ---
         high_low = df['high'] - df['low']
         high_close = np.abs(df['high'] - df['close'].shift())
         low_close = np.abs(df['low'] - df['close'].shift())
         df['atr'] = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1).rolling(14).mean()
+
+        # --- 5. ADX (Trend Strength - NEW CRITICAL FILTER) ---
+        plus_dm = df['high'].diff()
+        minus_dm = df['low'].diff()
+        plus_dm[plus_dm < 0] = 0
+        minus_dm[minus_dm > 0] = 0
+        
+        tr1 = pd.DataFrame(high_low)
+        tr2 = pd.DataFrame(high_close)
+        tr3 = pd.DataFrame(low_close)
+        frames = [tr1, tr2, tr3]
+        tr = pd.concat(frames, axis=1, join='inner').max(axis=1)
+        atr = tr.rolling(14).mean()
+        
+        plus_di = 100 * (plus_dm.ewm(alpha=1/14).mean() / atr)
+        minus_di = abs(100 * (minus_dm.ewm(alpha=1/14).mean() / atr))
+        dx = (abs(plus_di - minus_di) / abs(plus_di + minus_di)) * 100
+        df['adx'] = dx.rolling(14).mean()
+
         return df.dropna()
     except Exception as e: return f"ERROR: {str(e)}"
 
@@ -80,16 +105,15 @@ def calculate_cpr(df):
         H, L, C = prev['high'], prev['low'], prev['close']
         PP = (H + L + C) / 3.0
         R1, S1 = (2 * PP) - L, (2 * PP) - H
-        R2, S2 = PP + (H - L), PP - (H - L) 
+        R2, S2 = PP + (H - L), PP - (H - L)
         return {'PP': PP, 'R1': R1, 'S1': S1, 'R2': R2, 'S2': S2}
     except: return None
 
 # =========================================================================
-# === V25 ULTRA-PREMIUM DESIGNER ===
+# === UTILITIES & FORMATTING ===
 # =========================================================================
 
 def get_flags(symbol):
-    """Adds currency flags for visual appeal."""
     base, quote = symbol.split('/')
     flags = {
         "EUR": "🇪🇺", "USD": "🇺🇸", "GBP": "🇬🇧", "JPY": "🇯🇵",
@@ -97,209 +121,194 @@ def get_flags(symbol):
     }
     return f"{flags.get(base, '')}{flags.get(quote, '')}"
 
-def format_premium_card(symbol, signal, price, rsi, trend, tp1, tp2, sl):
-    # 1. Theme & Header Setup
-    if "STRONG BUY" in signal:
-        header = "🔴💎 <b>INSTITUTIONAL BUY</b> 💎🔴"
-        side, theme_color = "LONG 🟢", "🟢"
-        bar, urgency = "🟩🟩🟩🟩🟩 MAXIMUM", "(💎 Oversold bounce)" if rsi < 30 else ""
-    elif "STRONG SELL" in signal:
-        header = "🔴💎 <b>INSTITUTIONAL SELL</b> 💎🔴"
-        side, theme_color = "SHORT 🔴", "🔴"
-        bar, urgency = "🟥🟥🟥🟥🟥 MAXIMUM", "(💎 Overbought rejection)" if rsi > 70 else ""
-    elif "BUY" in signal:
-        header = "🟢 <b>BUY SIGNAL</b> 🟢"
-        side, theme_color = "LONG 🟢", "🟢"
-        bar, urgency = "🟩🟩🟩⬜⬜", ""
-    elif "SELL" in signal:
-        header = "🔴 <b>SELL SIGNAL</b> 🔴"
-        side, theme_color = "SHORT 🔴", "🔴"
-        bar, urgency = "🟥🟥🟥⬜⬜", ""
-    else:
-        # Don't format Neutral cards for trading
-        return None
+def calculate_pips(symbol, entry, current_price):
+    diff = current_price - entry
+    if "JPY" in symbol: multiplier = 100
+    elif "XAU" in symbol: multiplier = 10
+    elif "BTC" in symbol: multiplier = 1
+    else: multiplier = 10000
+    return diff * multiplier
 
-    # 2. Formatting & Icons
+def format_premium_card(symbol, signal, price, rsi, trend, tp1, tp2, sl, adx):
+    if "STRONG BUY" in signal:
+        header = "🚀💎 <b>SNIPER ENTRY: BUY</b> 💎🚀"
+        side = "LONG 🟢"
+        bar = "🟩🟩🟩🟩🟩 95% CONFIDENCE"
+    elif "STRONG SELL" in signal:
+        header = "🔻💎 <b>SNIPER ENTRY: SELL</b> 💎🔻"
+        side = "SHORT 🔴"
+        bar = "🟥🟥🟥🟥🟥 95% CONFIDENCE"
+    else:
+        return None # We only trade STRONG signals now
+
     fmt = ",.2f" if "JPY" in symbol or "XAU" in symbol or "BTC" in symbol else ",.5f"
     flags = get_flags(symbol)
-    trend_icon = "↗️ Bullish Momentum" if "Bullish" in trend else "↘️ Bearish Momentum"
     
-    # 3. The V25 Layout
     msg = (
         f"{header}\n"
         f"〰️〰️〰️〰️〰️〰️〰️〰️〰️〰️\n"
         f"┏ {flags} <b>{symbol}</b> 🔸 <b>{side}</b> ┓\n"
         f"┗ 💵 <b>ENTRY:</b> <code>{price:{fmt}}</code> ┛\n\n"
-        
-        f"📊 <b>MARKET INTEL</b>\n"
-        f"• <b>Trend:</b> {trend_icon}\n"
-        f"• <b>RSI:</b> <code>{rsi:.0f}</code> {urgency}\n"
-        f"• <b>Strength:</b> {bar}\n\n"
-        
+        f"📊 <b>HIGH PRECISION INTEL</b>\n"
+        f"• <b>Trend:</b> {trend}\n"
+        f"• <b>ADX Power:</b> <code>{adx:.0f}</code> (Trend Strength)\n"
+        f"• <b>RSI:</b> <code>{rsi:.0f}</code>\n"
+        f"• <b>Signal Strength:</b> {bar}\n\n"
         f"🎯 <b>PROFIT TARGETS</b>\n"
         f"🥇 <b>TP1:</b> <code>{tp1:{fmt}}</code>\n"
         f"🥈 <b>TP2:</b> <code>{tp2:{fmt}}</code>\n\n"
-        
         f"🛡️ <b>RISK MANAGEMENT</b>\n"
         f"🧱 <b>SL:</b> <code>{sl:{fmt}}</code>\n"
         f"〰️〰️〰️〰️〰️〰️〰️〰️〰️〰️\n"
-        f"<i>🤖 AI BOT • V25 Premium</i>"
+        f"<i>🤖 AI BOT • Sniper Edition</i>"
     )
     return msg
 
-# =========================================================================
-# === NEW: TRADE MONITORING & REPORTING ENGINE ===
-# =========================================================================
-
-async def check_active_trades(app_instance, symbol, current_price):
-    """Checks if any active trade for the symbol has hit TP or SL."""
-    global ACTIVE_TRADES, TRADE_HISTORY
+def format_result_card(symbol, result_type, pips, entry, exit_price):
+    flags = get_flags(symbol)
+    fmt = ",.2f" if "JPY" in symbol or "XAU" in symbol or "BTC" in symbol else ",.5f"
     
-    # Filter trades for this symbol
-    for trade in ACTIVE_TRADES[:]: # Copy list to safely modify
-        if trade['symbol'] == symbol:
-            result = None
-            pnl = 0
-            
-            # CHECK BUY CONDITIONS
-            if "BUY" in trade['type']:
-                if current_price >= trade['tp']:
-                    result = "WIN 🏆"
-                    pnl = current_price - trade['entry']
-                elif current_price <= trade['sl']:
-                    result = "LOSS ❌"
-                    pnl = trade['sl'] - trade['entry'] # Negative
-            
-            # CHECK SELL CONDITIONS
-            elif "SELL" in trade['type']:
-                if current_price <= trade['tp']:
-                    result = "WIN 🏆"
-                    pnl = trade['entry'] - current_price
-                elif current_price >= trade['sl']:
-                    result = "LOSS ❌"
-                    pnl = trade['entry'] - trade['sl'] # Negative
+    if result_type == "WIN":
+        header = "🏆 <b>PROFIT SECURED</b> 🏆"
+        pip_text = f"+{pips:.1f} Pips 🤑"
+    else:
+        header = "🛡️ <b>STOP LOSS HIT</b> 🛡️"
+        pip_text = f"{pips:.1f} Pips 🩸"
 
-            # IF OUTCOME DECIDED
-            if result:
-                # Remove from Active, Add to History
-                ACTIVE_TRADES.remove(trade)
-                trade['result'] = result
-                trade['exit_price'] = current_price
-                trade['close_time'] = datetime.now()
-                TRADE_HISTORY.append(trade)
-                
-                # Send Notification
-                flags = get_flags(symbol)
-                outcome_header = "💚 <b>TAKE PROFIT SMASHED!</b> 💚" if "WIN" in result else "🔻 <b>STOP LOSS HIT</b> 🔻"
-                
-                msg = (
-                    f"{outcome_header}\n"
-                    f"〰️〰️〰️〰️〰️〰️〰️〰️〰️〰️\n"
-                    f"┏ {flags} <b>{symbol}</b> 🔸 {result} ┓\n"
-                    f"┃ 🚪 <b>Entry:</b> <code>{trade['entry']}</code>\n"
-                    f"┃ 🏁 <b>Exit:</b> <code>{current_price}</code>\n"
-                    f"┗ 🎰 <b>Type:</b> {trade['type']}\n\n"
-                    f"<i>Trade Closed. Check Report for stats.</i>"
-                )
-                await app_instance.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode='HTML')
+    msg = (
+        f"{header}\n"
+        f"〰️〰️〰️〰️〰️〰️〰️〰️〰️〰️\n"
+        f"┏ {flags} <b>{symbol}</b> 🔸 <b>CLOSED</b> ┓\n"
+        f"┗ 💵 <b>RESULT:</b> {pip_text} ┛\n\n"
+        f"🚪 <b>Entry:</b> <code>{entry:{fmt}}</code>\n"
+        f"🏁 <b>Exit:</b> <code>{exit_price:{fmt}}</code>\n"
+        f"〰️〰️〰️〰️〰️〰️〰️〰️〰️〰️\n"
+        f"<i>🤖 AI BOT • Trade Result</i>"
+    )
+    return msg
 
 async def send_12h_report(app_instance):
-    """Generates a Win/Loss report every 12 hours."""
-    global TRADE_HISTORY
+    if not TRADE_HISTORY: return
+    wins = sum(1 for t in TRADE_HISTORY if t['result'] == 'WIN')
+    losses = sum(1 for t in TRADE_HISTORY if t['result'] == 'LOSS')
+    total_pips = sum(t['pips'] for t in TRADE_HISTORY)
+    win_rate = (wins / len(TRADE_HISTORY)) * 100 if len(TRADE_HISTORY) > 0 else 0
+    net_color = "🟢" if total_pips > 0 else "🔴"
     
-    if not TRADE_HISTORY:
-        return # No trades to report
-        
-    wins = sum(1 for t in TRADE_HISTORY if "WIN" in t['result'])
-    losses = sum(1 for t in TRADE_HISTORY if "LOSS" in t['result'])
-    total = wins + losses
-    win_rate = (wins / total * 100) if total > 0 else 0
-    
-    report_msg = (
-        f"📑 <b>12-HOUR PERFORMANCE REPORT</b> 📑\n"
+    msg = (
+        f"📑 <b>12-HOUR SNIPER REPORT</b>\n"
         f"〰️〰️〰️〰️〰️〰️〰️〰️〰️〰️\n"
-        f"🏆 <b>WINS:</b> {wins}\n"
-        f"❌ <b>LOSSES:</b> {losses}\n"
-        f"📊 <b>WIN RATE:</b> {win_rate:.1f}%\n"
-        f"〰️〰️〰️〰️〰️〰️〰️〰️〰️〰️\n"
-        f"<i>Clearing history for next session...</i>"
+        f"🔢 <b>Total Trades:</b> {len(TRADE_HISTORY)}\n"
+        f"✅ <b>Wins:</b> {wins}\n"
+        f"❌ <b>Losses:</b> {losses}\n"
+        f"🎯 <b>Win Rate:</b> {win_rate:.1f}%\n\n"
+        f"💰 <b>NET PIPS:</b> {net_color} <b>{total_pips:.1f}</b>\n"
+        f"〰️〰️〰️〰️〰️〰️〰️〰️〰️〰️"
     )
-    
-    await app_instance.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=report_msg, parse_mode='HTML')
-    TRADE_HISTORY.clear() # Reset for next 12 hours
+    try:
+        await app_instance.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode='HTML')
+        TRADE_HISTORY.clear()
+    except Exception as e: print(f"Report Error: {e}")
 
 # =========================================================================
-# === ANALYSIS CYCLE ===
+# === SNIPER ANALYSIS ENGINE (90% LOGIC) ===
 # =========================================================================
 
 async def run_analysis_cycle(app_instance):
-    print(f"🔄 Scanning 8 Pairs... {datetime.now()}")
+    print(f"🔄 Sniper Scan... {datetime.now()}")
     for symbol in WATCHLIST:
         try:
             df = fetch_data(symbol)
             if isinstance(df, str):
-                 print(f"Skipping {symbol}: {df}")
-                 time.sleep(5)
+                 time.sleep(2)
                  continue
 
+            last = df.iloc[-1]
+            current_price = last['close']
+            
+            # --- ACTIVE TRADE MANAGEMENT ---
+            if symbol in ACTIVE_TRADES:
+                trade = ACTIVE_TRADES[symbol]
+                if trade['side'] == "LONG":
+                    pips = calculate_pips(symbol, trade['entry'], current_price)
+                    if current_price >= trade['tp1']: # WIN
+                        await app_instance.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=format_result_card(symbol, "WIN", pips, trade['entry'], current_price), parse_mode='HTML')
+                        TRADE_HISTORY.append({'symbol': symbol, 'result': 'WIN', 'pips': pips})
+                        del ACTIVE_TRADES[symbol]
+                        continue
+                    elif current_price <= trade['sl']: # LOSS
+                        await app_instance.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=format_result_card(symbol, "LOSS", pips, trade['entry'], current_price), parse_mode='HTML')
+                        TRADE_HISTORY.append({'symbol': symbol, 'result': 'LOSS', 'pips': pips})
+                        del ACTIVE_TRADES[symbol]
+                        continue
+                elif trade['side'] == "SHORT":
+                    pips = calculate_pips(symbol, trade['entry'], current_price) * -1
+                    if current_price <= trade['tp1']: # WIN
+                        await app_instance.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=format_result_card(symbol, "WIN", pips, trade['entry'], current_price), parse_mode='HTML')
+                        TRADE_HISTORY.append({'symbol': symbol, 'result': 'WIN', 'pips': pips})
+                        del ACTIVE_TRADES[symbol]
+                        continue
+                    elif current_price >= trade['sl']: # LOSS
+                        await app_instance.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=format_result_card(symbol, "LOSS", pips, trade['entry'], current_price), parse_mode='HTML')
+                        TRADE_HISTORY.append({'symbol': symbol, 'result': 'LOSS', 'pips': pips})
+                        del ACTIVE_TRADES[symbol]
+                        continue
+                continue 
+
+            # --- SNIPER ENTRY LOGIC ---
             cpr = calculate_cpr(df)
             if not cpr: continue
 
-            last = df.iloc[-1]
             price = last['close']
-            
-            # --- NEW: CHECK EXISTING TRADES FIRST ---
-            await check_active_trades(app_instance, symbol, price)
-            
-            # If we already have a trade running for this symbol, DO NOT generate a new signal
-            # This prevents multiple overlapping trades on the same pair
-            if any(t['symbol'] == symbol for t in ACTIVE_TRADES):
-                continue
-            
-            # --- SIGNAL GENERATION ---
-            score = 0
-            if price > last['ema_200']: score += 1
-            else: score -= 1
-            if last['macd'] > last['signal_line']: score += 1
-            else: score -= 1
             rsi = last['rsi']
+            adx = last['adx']
+            ema50 = last['ema_50']
+            ema200 = last['ema_200']
             
-            if 50 < rsi < 70: score += 0.5
-            elif rsi < 30: score += 0.5
-            elif rsi > 70: score -= 0.5
-            elif 30 < rsi < 50: score -= 0.5
-            if price > cpr['PP']: score += 0.5
-            else: score -= 0.5
-
-            signal = "WAIT (Neutral)"
-            if score >= 2.5: signal = "STRONG BUY"
-            elif 1.0 <= score < 2.5: signal = "BUY"
-            elif -2.5 < score <= -1.0: signal = "SELL"
-            elif score <= -2.5: signal = "STRONG SELL"
-
-            tp1 = cpr['R1'] if score > 0 else cpr['S1']
-            tp2 = cpr['R2'] if score > 0 else cpr['S2']
-            sl = price - (last['atr'] * 1.5) if score > 0 else price + (last['atr'] * 1.5)
-            trend = "Bullish" if price > last['ema_200'] else "Bearish"
-
-            # Only send message if it's not Neutral
-            msg = format_premium_card(symbol, signal, price, rsi, trend, tp1, tp2, sl)
+            signal = "WAIT"
             
-            if msg:
-                # --- NEW: REGISTER THE TRADE ---
-                new_trade = {
-                    'symbol': symbol,
-                    'type': signal, # BUY or SELL
-                    'entry': price,
-                    'tp': tp2, # Using TP2 as the target for win/loss calculation
-                    'sl': sl,
-                    'start_time': datetime.now()
-                }
-                ACTIVE_TRADES.append(new_trade)
-                
-                await app_instance.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode='HTML')
+            # FILTER 1: ADX > 25 (Trend Strength)
+            # If ADX is below 25, market is chopping/sideways. WE DO NOT TRADE.
+            if adx < 25: 
+                continue 
 
-            # Wait 15s to respect API limits
+            # STRATEGY 1: GOLDEN TREND BUY
+            # Price > EMA50 > EMA200 AND MACD Crossover AND RSI Healthy
+            if (price > ema50 > ema200) and (last['macd'] > last['signal_line']) and (50 <= rsi <= 70):
+                signal = "STRONG BUY"
+            
+            # STRATEGY 2: GOLDEN TREND SELL
+            # Price < EMA50 < EMA200 AND MACD Crossunder AND RSI Healthy
+            elif (price < ema50 < ema200) and (last['macd'] < last['signal_line']) and (30 <= rsi <= 50):
+                signal = "STRONG SELL"
+
+            # STRATEGY 3: EXTREME REVERSAL (Oversold/Overbought with ADX exhaustion)
+            elif rsi < 30 and price > cpr['S1']: # Oversold Bounce
+                signal = "STRONG BUY"
+            elif rsi > 70 and price < cpr['R1']: # Overbought Rejection
+                signal = "STRONG SELL"
+
+            if "STRONG" in signal:
+                # RISK MANAGEMENT
+                # TP is conservative (1.5x ATR), SL is tight (1.0x ATR) to ensure R:R
+                if "BUY" in signal:
+                    tp1 = price + (last['atr'] * 2.0)
+                    tp2 = price + (last['atr'] * 3.5)
+                    sl = price - (last['atr'] * 1.2) # Tighter SL
+                    trend = "Bullish Uptrend"
+                    side = "LONG"
+                else:
+                    tp1 = price - (last['atr'] * 2.0)
+                    tp2 = price - (last['atr'] * 3.5)
+                    sl = price + (last['atr'] * 1.2) # Tighter SL
+                    trend = "Bearish Downtrend"
+                    side = "SHORT"
+
+                msg = format_premium_card(symbol, signal, price, rsi, trend, tp1, tp2, sl, adx)
+                if msg:
+                    ACTIVE_TRADES[symbol] = {'entry': price, 'tp1': tp1, 'sl': sl, 'side': side, 'start_time': datetime.now()}
+                    await app_instance.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode='HTML')
+
             time.sleep(15)
             
         except Exception as e:
@@ -310,49 +319,36 @@ async def run_analysis_cycle(app_instance):
 # =========================================================================
 
 async def start_command(update, context):
-    await update.message.reply_text("👋 <b>AI BOT V25 Online</b>", parse_mode='HTML')
+    await update.message.reply_text("👋 <b>SNIPER BOT V30 Online</b>", parse_mode='HTML')
 
 def start_bot_process():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    
-    # Clear Webhooks
     temp_bot = Bot(token=TELEGRAM_BOT_TOKEN)
     try: loop.run_until_complete(temp_bot.delete_webhook(drop_pending_updates=True))
     except: pass
 
-    # App
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start_command))
 
     try:
         loop.run_until_complete(application.bot.send_message(
             chat_id=TELEGRAM_CHAT_ID, 
-            text="🚀 <b>SYSTEM RESTORED (V25 PREMIUM)</b>\nFeature Added: Trade Tracker & 12H Reports.", 
+            text="🚀 <b>SNIPER MODE ACTIVATED</b>\nHigh Precision Filters: ON\nADX Trend Filter: ON", 
             parse_mode='HTML'
         ))
     except: pass
 
-    # Triggers
     loop.create_task(run_analysis_cycle(application))
-
     scheduler = BackgroundScheduler()
-    # Analysis Job (every 1 Hour)
-    scheduler.add_job(lambda: asyncio.run_coroutine_threadsafe(run_analysis_cycle(application), loop), 'interval', minutes=55)
-    
-    # --- NEW: 12-HOUR REPORT JOB ---
+    scheduler.add_job(lambda: asyncio.run_coroutine_threadsafe(run_analysis_cycle(application), loop), 'interval', minutes=30)
     scheduler.add_job(lambda: asyncio.run_coroutine_threadsafe(send_12h_report(application), loop), 'interval', hours=12)
-    
     scheduler.start()
 
-    # Poll
     while True:
-        try:
-            application.run_polling(stop_signals=None, close_loop=False)
-        except Conflict:
-            time.sleep(15)
-        except Exception as e:
-            time.sleep(10)
+        try: application.run_polling(stop_signals=None, close_loop=False)
+        except Conflict: time.sleep(15)
+        except Exception as e: time.sleep(10)
 
 if os.environ.get("WERKZEUG_RUN_MAIN") != "true":
     t = threading.Thread(target=start_bot_process, daemon=True)
@@ -361,4 +357,3 @@ if os.environ.get("WERKZEUG_RUN_MAIN") != "true":
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port, threaded=True)
-
