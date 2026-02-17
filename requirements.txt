@@ -1,9 +1,8 @@
 flask
-gunicorn
-apscheduler
 python-telegram-bot
 pandas
 numpy
 requests
+apscheduler
 python-dotenv
-ccxt
+gunicorn
