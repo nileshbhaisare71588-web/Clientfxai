@@ -18,7 +18,7 @@ WATCHLIST = [
     "EUR/USD", "GBP/JPY", "AUD/USD", "GBP/USD",
     "XAU/USD", "AUD/CAD", "AUD/JPY", "BTC/USD"
 ]
-TIMEFRAME = "1h"
+TIMEFRAME = "30min"
 
 # --- STATE MANAGEMENT ---
 ACTIVE_TRADES = {} 
@@ -68,7 +68,6 @@ def fetch_data(symbol):
         
         df['volume'] = df['volume'].astype(float) if 'volume' in df.columns else 0.0
 
-        # Indicators
         df['ema_50'] = df['close'].ewm(span=50, adjust=False).mean()
         df['ema_200'] = df['close'].ewm(span=200, adjust=False).mean()
         
@@ -82,7 +81,6 @@ def fetch_data(symbol):
         df['tr2'] = abs(df['low'] - df['close'].shift())
         df['atr'] = df[['tr0', 'tr1', 'tr2']].max(axis=1).rolling(14).mean()
 
-        # MACD Calculation
         exp1 = df['close'].ewm(span=12, adjust=False).mean()
         exp2 = df['close'].ewm(span=26, adjust=False).mean()
         df['macd'] = exp1 - exp2
@@ -197,6 +195,8 @@ def send_telegram_message(text):
 
 def run_bot():
     print("Bot started scanning...")
+    send_telegram_message("✅ AI Adaptive Bot V4.1 is online and scanning 30m timeframes!")
+    
     while True:
         for symbol in WATCHLIST:
             df = fetch_data(symbol)
@@ -211,14 +211,11 @@ def run_bot():
                 send_telegram_message(msg)
                 print(f"Signal sent for {symbol}")
                 
-            time.sleep(2) # Prevent API rate limits
+            time.sleep(2) 
         
-        print("Cycle complete. Waiting for next hour...")
-        time.sleep(3600) # Wait 1 hour based on TIMEFRAME
+        print("Cycle complete. Waiting for 30 minutes...")
+        time.sleep(1800) 
 
 if __name__ == '__main__':
-    # Run bot loop in background
     threading.Thread(target=run_bot, daemon=True).start()
-    
-    # Run Flask app to keep alive
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
