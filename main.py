@@ -25,7 +25,7 @@ app = Flask(__name__)
 def home(): return "AI Adaptive Bot V4.1 Running"
 
 # =========================================================================
-# === DATA ENGINE & LOGIC (Merged for brevity) ===
+# === DATA ENGINE & LOGIC ===
 # =========================================================================
 
 def calculate_chop_index(df, period=14):
@@ -78,4 +78,39 @@ def fetch_data(symbol):
         df['vol_ma'] = df['volume'].rolling(20).mean()
 
         return df.dropna()
-    except Exception as e: return
+    except Exception as e: return f"ERROR: {str(e)}"
+
+def generate_signal(df, symbol):
+    if len(df) < 20: return None
+        
+    current, previous = df.iloc[-1], df.iloc[-2]
+    trend_up = current['close'] > current['ema_200']
+    trend_down = current['close'] < current['ema_200']
+    is_trending = current['chop'] < 50 
+    
+    macd_bull = (current['macd'] > current['signal_line']) and (previous['macd'] <= previous['signal_line'])
+    macd_bear = (current['macd'] < current['signal_line']) and (previous['macd'] >= previous['signal_line'])
+    vol_spike = current['volume'] > current['vol_ma']
+    
+    signal, sl, tp1, tp2 = None, 0.0, 0.0, 0.0
+    
+    if trend_up and is_trending and macd_bull and current['rsi'] < 70:
+        signal = "BUY"
+        sl, tp1, tp2 = current['close'] - (current['atr'] * 1.5), current['close'] + (current['atr'] * 2.0), current['close'] + (current['atr'] * 3.5)
+    elif trend_down and is_trending and macd_bear and current['rsi'] > 30:
+        signal = "SELL"
+        sl, tp1, tp2 = current['close'] + (current['atr'] * 1.5), current['close'] - (current['atr'] * 2.0), current['close'] - (current['atr'] * 3.5)
+        
+    if signal:
+        return {"symbol": symbol, "signal": signal, "price": current['close'], "rsi": current['rsi'], "trend": "UP" if trend_up else "DOWN", "tp1": tp1, "tp2": tp2, "sl": sl, "vol_spike": vol_spike, "chop": current['chop']}
+    return None
+
+# =========================================================================
+# === TELEGRAM & EXECUTION ===
+# =========================================================================
+
+def send_telegram_message(text):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("ERROR: Tokens missing.")
+        return
+    url
